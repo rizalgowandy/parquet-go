@@ -1,9 +1,10 @@
-name: Test
+name: Tests
 on:
 - pull_request
 
 jobs:
   test:
+    name: Stable versions
     strategy:
       matrix:
         go:
@@ -27,3 +28,24 @@ jobs:
 
     - name: Run Tests
       run: go test -race ./...
+
+
+  gotip:
+    name: Gotip
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install gotip
+        run: |
+          git clone --filter=tree:0 https://go.googlesource.com/go $HOME/gotip
+          cd $HOME/gotip/src && ./make.bash
+          echo "$HOME/gotip/bin" >> $GITHUB_PATH
+
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - run: go version
+
+      - name: Run tests
+        run: go test -race ./...
