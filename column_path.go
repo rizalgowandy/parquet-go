@@ -1,11 +1,13 @@
 package parquet
 
-import "strings"
+import (
+	"strings"
+)
 
 type columnPath []string
 
-func (path columnPath) append(name string) columnPath {
-	return append(path[:len(path):len(path)], name)
+func (path columnPath) append(names ...string) columnPath {
+	return append(path[:len(path):len(path)], names...)
 }
 
 func (path columnPath) equal(other columnPath) bool {
@@ -53,8 +55,8 @@ func stringsAreOrdered(strings1, strings2 []string) bool {
 type leafColumn struct {
 	node               Node
 	path               columnPath
-	maxRepetitionLevel int8
-	maxDefinitionLevel int8
+	maxRepetitionLevel byte
+	maxDefinitionLevel byte
 	columnIndex        int16
 }
 
@@ -71,7 +73,7 @@ func forEachLeafColumn(node Node, path columnPath, columnIndex, maxRepetitionLev
 		maxDefinitionLevel++
 	}
 
-	if isLeaf(node) {
+	if node.Leaf() {
 		do(leafColumn{
 			node:               node,
 			path:               path,
@@ -82,10 +84,10 @@ func forEachLeafColumn(node Node, path columnPath, columnIndex, maxRepetitionLev
 		return columnIndex + 1
 	}
 
-	for _, name := range node.ChildNames() {
+	for _, field := range node.Fields() {
 		columnIndex = forEachLeafColumn(
-			node.ChildByName(name),
-			path.append(name),
+			field,
+			path.append(field.Name()),
 			columnIndex,
 			maxRepetitionLevel,
 			maxDefinitionLevel,
@@ -98,7 +100,7 @@ func forEachLeafColumn(node Node, path columnPath, columnIndex, maxRepetitionLev
 
 func lookupColumnPath(node Node, path columnPath) Node {
 	for node != nil && len(path) > 0 {
-		node = node.ChildByName(path[0])
+		node = fieldByName(node, path[0])
 		path = path[1:]
 	}
 	return node

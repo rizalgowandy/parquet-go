@@ -6,7 +6,7 @@ import (
 	"github.com/segmentio/parquet-go/deprecated"
 )
 
-// Types supported by Parquet. These types are intended to be used incombination
+// Types supported by Parquet. These types are intended to be used in combination
 // with the encodings to control the on disk storage format. For example INT16
 // is not included as a type since a good encoding of INT32 would handle this.
 type Type int32
@@ -134,7 +134,8 @@ type DecimalType struct {
 }
 
 func (t *DecimalType) String() string {
-	return fmt.Sprintf("DECIMAL(%d,%d)", t.Scale, t.Precision)
+	// Matching parquet-cli's decimal string format: https://github.com/apache/parquet-mr/blob/d057b39d93014fe40f5067ee4a33621e65c91552/parquet-column/src/test/java/org/apache/parquet/parser/TestParquetParser.java#L249-L265
+	return fmt.Sprintf("DECIMAL(%d,%d)", t.Precision, t.Scale)
 }
 
 // Time units for logical types.
@@ -281,11 +282,11 @@ func (t *LogicalType) String() string {
 
 // Represents a element inside a schema definition.
 //
-//	- if it is a group (inner node) then type is undefined and num_children is
-//    defined
+//   - if it is a group (inner node) then type is undefined and num_children is
+//     defined
 //
-//	- if it is a primitive type (leaf) then type is defined and num_children is
-//    undefined
+//   - if it is a primitive type (leaf) then type is defined and num_children is
+//     undefined
 //
 // The nodes are listed in depth first traversal order.
 type SchemaElement struct {
@@ -917,7 +918,7 @@ type ColumnIndex struct {
 	MinValues [][]byte `thrift:"2,required"`
 	MaxValues [][]byte `thrift:"3,required"`
 
-	// Stores whether both min_values and max_values are orderd and if so, in
+	// Stores whether both min_values and max_values are ordered and if so, in
 	// which direction. This allows readers to perform binary searches in both
 	// lists. Readers cannot assume that max_values[i] <= min_values[i+1], even
 	// if the lists are ordered.
@@ -992,7 +993,7 @@ type FileMetaData struct {
 	//
 	// Without column_orders, the meaning of the min_value and max_value fields
 	// in the Statistics object and the ColumnIndex object is undefined. To ensure
-	// well-defined behaviour, if these fields are written to a Parquet file,
+	// well-defined behavior, if these fields are written to a Parquet file,
 	// column_orders must be written as well.
 	//
 	// The obsolete min and max fields in the Statistics object are always sorted

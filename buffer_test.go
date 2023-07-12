@@ -2,11 +2,14 @@ package parquet_test
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"math"
+	"math/rand"
+	"reflect"
 	"sort"
+	"strconv"
 	"testing"
-	"testing/quick"
 
 	"github.com/segmentio/parquet-go"
 	"github.com/segmentio/parquet-go/encoding"
@@ -107,6 +110,21 @@ var bufferTests = [...]struct {
 	},
 
 	{
+		scenario: "fixed length byte array",
+		typ:      parquet.FixedLenByteArrayType(10),
+		values: [][]interface{}{
+			{},
+			{[10]byte{}},
+			{[10]byte{0: 1}},
+			{
+				[10]byte{0: 0}, [10]byte{0: 2}, [10]byte{0: 1}, [10]byte{0: 4}, [10]byte{0: 3},
+				[10]byte{0: 6}, [10]byte{0: 5}, [10]byte{0: 8}, [10]byte{0: 7}, [10]byte{0: 10},
+				[10]byte{0: 11}, [10]byte{0: 12}, [10]byte{9: 0xFF},
+			},
+		},
+	},
+
+	{
 		scenario: "uuid",
 		typ:      parquet.UUID().Type(),
 		values: [][]interface{}{
@@ -160,7 +178,7 @@ func TestBuffer(t *testing.T) {
 				typ      parquet.Type
 			}{
 				{scenario: "plain", typ: test.typ},
-				{scenario: "indexed", typ: test.typ.NewDictionary(0).Type()},
+				{scenario: "indexed", typ: test.typ.NewDictionary(0, 0, test.typ.NewValues(nil, nil)).Type()},
 			} {
 				t.Run(config.scenario, func(t *testing.T) {
 					for _, mod := range [...]struct {
@@ -188,30 +206,25 @@ func TestBuffer(t *testing.T) {
 
 									options := []parquet.RowGroupOption{
 										schema,
-										parquet.ColumnBufferSize(1024),
+										parquet.ColumnBufferCapacity(100),
 									}
 									if ordering.sorting != nil {
-										options = append(options, parquet.SortingColumns(ordering.sorting))
+										options = append(options,
+											parquet.SortingRowGroupConfig(
+												parquet.SortingColumns(ordering.sorting),
+											),
+										)
 									}
 
 									content := new(bytes.Buffer)
-									decoder := parquet.Plain.NewDecoder(content)
-									encoder := parquet.Plain.NewEncoder(content)
-									reader := config.typ.NewColumnReader(0, 32)
 									buffer := parquet.NewBuffer(options...)
-
-									reset := func() {
-										content.Reset()
-										decoder.Reset(content)
-										encoder.Reset(content)
-										reader.Reset(decoder)
-										buffer.Reset()
-									}
 
 									for _, values := range test.values {
 										t.Run("", func(t *testing.T) {
-											reset()
-											testBuffer(t, schema.ChildByName("data"), reader, buffer, encoder, values, ordering.sortFunc)
+											defer content.Reset()
+											defer buffer.Reset()
+											fields := schema.Fields()
+											testBuffer(t, fields[0], buffer, &parquet.Plain, values, ordering.sortFunc)
 										})
 									}
 								})
@@ -236,7 +249,7 @@ func descending(typ parquet.Type, values []parquet.Value) {
 	sort.Slice(values, func(i, j int) bool { return typ.Compare(values[i], values[j]) > 0 })
 }
 
-func testBuffer(t *testing.T, node parquet.Node, reader parquet.ValueReader, buffer *parquet.Buffer, encoder encoding.Encoder, values []interface{}, sortFunc sortFunc) {
+func testBuffer(t *testing.T, node parquet.Node, buffer *parquet.Buffer, encoding encoding.Encoding, values []interface{}, sortFunc sortFunc) {
 	repetitionLevel := 0
 	definitionLevel := 0
 	if !node.Required() {
@@ -251,12 +264,14 @@ func testBuffer(t *testing.T, node parquet.Node, reader parquet.ValueReader, buf
 	}
 
 	for i := range batch {
-		if err := buffer.WriteRow(batch[i : i+1]); err != nil {
+		_, err := buffer.WriteRows([]parquet.Row{batch[i : i+1]})
+		if err != nil {
 			t.Fatalf("writing value to row group: %v", err)
 		}
 	}
 
-	if numRows := buffer.NumRows(); numRows != int64(len(batch)) {
+	numRows := buffer.NumRows()
+	if numRows != int64(len(batch)) {
 		t.Fatalf("number of rows mismatch: want=%d got=%d", len(batch), numRows)
 	}
 
@@ -273,7 +288,7 @@ func testBuffer(t *testing.T, node parquet.Node, reader parquet.ValueReader, buf
 	sortFunc(typ, batch)
 	sort.Sort(buffer)
 
-	page := buffer.Column(0).(parquet.ColumnBuffer).Page()
+	page := buffer.ColumnBuffers()[0].Page()
 	numValues := page.NumValues()
 	if numValues != int64(len(batch)) {
 		t.Fatalf("number of values mistmatch: want=%d got=%d", len(batch), numValues)
@@ -284,16 +299,15 @@ func testBuffer(t *testing.T, node parquet.Node, reader parquet.ValueReader, buf
 		t.Fatalf("number of nulls mismatch: want=0 got=%d", numNulls)
 	}
 
-	min, max := page.Bounds()
+	min, max, hasBounds := page.Bounds()
+	if !hasBounds && numRows > 0 {
+		t.Fatal("page bounds are missing")
+	}
 	if !parquet.Equal(min, minValue) {
 		t.Fatalf("min value mismatch: want=%v got=%v", minValue, min)
 	}
 	if !parquet.Equal(max, maxValue) {
 		t.Fatalf("max value mismatch: want=%v got=%v", maxValue, max)
-	}
-
-	if err := page.WriteTo(encoder); err != nil {
-		t.Fatalf("flushing page writer: %v", err)
 	}
 
 	// We write a single value per row, so num values = num rows for all pages
@@ -306,7 +320,6 @@ func testBuffer(t *testing.T, node parquet.Node, reader parquet.ValueReader, buf
 		values   []parquet.Value
 		reader   parquet.ValueReader
 	}{
-		{"test", batch, reader},
 		{"page", batch, page.Values()},
 		{"head", batch[:halfValues], page.Slice(0, halfValues).Values()},
 		{"tail", batch[halfValues:], page.Slice(halfValues, numValues).Values()},
@@ -357,15 +370,15 @@ func TestBufferGenerateBloomFilters(t *testing.T) {
 		buffer := parquet.NewBuffer()
 		writer := parquet.NewWriter(output,
 			parquet.BloomFilters(
-				parquet.SplitBlockFilter("X"),
-				parquet.SplitBlockFilter("Y"),
-				parquet.SplitBlockFilter("Z"),
+				parquet.SplitBlockFilter(10, "X"),
+				parquet.SplitBlockFilter(10, "Y"),
+				parquet.SplitBlockFilter(10, "Z"),
 			),
 		)
 		for i := range rows {
 			buffer.Write(&rows[i])
 		}
-		_, err := parquet.CopyRows(writer, buffer.Rows())
+		_, err := copyRowsAndClose(writer, buffer.Rows())
 		if err != nil {
 			t.Error(err)
 			return false
@@ -381,10 +394,11 @@ func TestBufferGenerateBloomFilters(t *testing.T) {
 			t.Error(err)
 			return false
 		}
-		rowGroup := f.RowGroup(0)
-		x := rowGroup.Column(0)
-		y := rowGroup.Column(1)
-		z := rowGroup.Column(2)
+		rowGroup := f.RowGroups()[0]
+		columns := rowGroup.ColumnChunks()
+		x := columns[0]
+		y := columns[1]
+		z := columns[2]
 
 		for i, col := range []parquet.ColumnChunk{x, y, z} {
 			if col.BloomFilter() == nil {
@@ -417,7 +431,328 @@ func TestBufferGenerateBloomFilters(t *testing.T) {
 		return true
 	}
 
-	if err := quick.Check(f, nil); err != nil {
+	if err := quickCheck(f); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestBufferRoundtripNestedRepeated(t *testing.T) {
+	type C struct {
+		D int
+	}
+	type B struct {
+		C []C
+	}
+	type A struct {
+		B []B
+	}
+
+	// Write enough objects to exceed first page
+	buffer := parquet.NewBuffer()
+	var objs []A
+	for i := 0; i < 6; i++ {
+		o := A{[]B{{[]C{
+			{i},
+			{i},
+		}}}}
+		buffer.Write(&o)
+		objs = append(objs, o)
+	}
+
+	buf := new(bytes.Buffer)
+	w := parquet.NewWriter(buf, parquet.PageBufferSize(100))
+	w.WriteRowGroup(buffer)
+	w.Flush()
+	w.Close()
+
+	file := bytes.NewReader(buf.Bytes())
+	r := parquet.NewReader(file)
+	for i := 0; ; i++ {
+		o := new(A)
+		err := r.Read(o)
+		if errors.Is(err, io.EOF) {
+			if i < len(objs) {
+				t.Errorf("too few rows were read: %d<%d", i, len(objs))
+			}
+			break
+		}
+		if !reflect.DeepEqual(*o, objs[i]) {
+			t.Errorf("points mismatch at row index %d: want=%v got=%v", i, objs[i], o)
+		}
+	}
+}
+
+func TestBufferRoundtripNestedRepeatedPointer(t *testing.T) {
+	type C struct {
+		D *int
+	}
+	type B struct {
+		C []C
+	}
+	type A struct {
+		B []B
+	}
+
+	// Write enough objects to exceed first page
+	buffer := parquet.NewBuffer()
+	var objs []A
+	for i := 0; i < 6; i++ {
+		j := i
+		o := A{[]B{{[]C{
+			{&j},
+			{nil},
+		}}}}
+		buffer.Write(&o)
+		objs = append(objs, o)
+	}
+
+	buf := new(bytes.Buffer)
+	w := parquet.NewWriter(buf, parquet.PageBufferSize(100))
+	w.WriteRowGroup(buffer)
+	w.Flush()
+	w.Close()
+
+	file := bytes.NewReader(buf.Bytes())
+	r := parquet.NewReader(file)
+	for i := 0; ; i++ {
+		o := new(A)
+		err := r.Read(o)
+		if err == io.EOF {
+			break
+		}
+		if !reflect.DeepEqual(*o, objs[i]) {
+			t.Errorf("points mismatch at row index %d: want=%v got=%v", i, objs[i], o)
+		}
+	}
+}
+
+func TestRoundtripNestedRepeatedBytes(t *testing.T) {
+	type B struct {
+		C []byte
+	}
+	type A struct {
+		A string
+		B []B
+	}
+
+	var objs []A
+	for i := 0; i < 2; i++ {
+		o := A{
+			"test" + strconv.Itoa(i),
+			[]B{
+				{[]byte{byte(i)}},
+			},
+		}
+		objs = append(objs, o)
+	}
+
+	buf := new(bytes.Buffer)
+	w := parquet.NewWriter(buf, parquet.PageBufferSize(100))
+	for _, o := range objs {
+		w.Write(&o)
+	}
+	w.Close()
+
+	file := bytes.NewReader(buf.Bytes())
+
+	r := parquet.NewReader(file)
+	for i := 0; ; i++ {
+		o := new(A)
+		err := r.Read(o)
+		if errors.Is(err, io.EOF) {
+			if i < len(objs) {
+				t.Errorf("too few rows were read: %d<%d", i, len(objs))
+			}
+			break
+		}
+		if !reflect.DeepEqual(*o, objs[i]) {
+			t.Errorf("points mismatch at row index %d: want=%v got=%v", i, objs[i], o)
+		}
+	}
+}
+
+func TestBufferSeekToRow(t *testing.T) {
+	type B struct {
+		I int
+		C []string
+	}
+	type A struct {
+		B []B
+	}
+
+	buffer := parquet.NewBuffer()
+	var objs []A
+	for i := 0; i < 2; i++ {
+		o := A{
+			B: []B{
+				{I: i, C: []string{"foo", strconv.Itoa(i)}},
+				{I: i + 1, C: []string{"bar", strconv.Itoa(i + 1)}},
+			},
+		}
+		buffer.Write(&o)
+		objs = append(objs, o)
+	}
+
+	buf := new(bytes.Buffer)
+	w := parquet.NewWriter(buf)
+	w.WriteRowGroup(buffer)
+	w.Flush()
+	w.Close()
+
+	file := bytes.NewReader(buf.Bytes())
+	r := parquet.NewReader(file)
+
+	i := 1
+	o := new(A)
+	if err := r.SeekToRow(int64(i)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Read(o); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(*o, objs[i]) {
+		t.Errorf("points mismatch at row index %d: want=%v got=%v", i, objs[i], o)
+	}
+}
+
+type TestStruct struct {
+	A *string `parquet:"a,optional,dict"`
+}
+
+func TestOptionalDictWriteRowGroup(t *testing.T) {
+	s := parquet.SchemaOf(&TestStruct{})
+
+	str1 := "test1"
+	str2 := "test2"
+	records := []*TestStruct{
+		{A: nil},
+		{A: &str1},
+		{A: nil},
+		{A: &str2},
+		{A: nil},
+	}
+
+	buf := parquet.NewBuffer(s)
+	for _, rec := range records {
+		row := s.Deconstruct(nil, rec)
+		_, err := buf.WriteRows([]parquet.Row{row})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	b := bytes.NewBuffer(nil)
+	w := parquet.NewWriter(b)
+	_, err := w.WriteRowGroup(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNullsSortFirst(t *testing.T) {
+	s := parquet.SchemaOf(&TestStruct{})
+
+	str1 := "test1"
+	str2 := "test2"
+	records := []*TestStruct{
+		{A: &str1},
+		{A: nil},
+		{A: &str2},
+	}
+	buf := parquet.NewBuffer(
+		s,
+		parquet.SortingRowGroupConfig(parquet.SortingColumns(parquet.NullsFirst(parquet.Ascending(s.Columns()[0][0])))),
+	)
+	for _, rec := range records {
+		row := s.Deconstruct(nil, rec)
+		_, err := buf.WriteRows([]parquet.Row{row})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sort.Sort(buf)
+
+	rows := buf.Rows()
+	defer rows.Close()
+	rowBuf := make([]parquet.Row, len(records))
+	if _, err := rows.ReadRows(rowBuf); err != nil {
+		t.Fatal(err)
+	}
+
+	resultRecords := make([]TestStruct, len(records))
+	for i, r := range rowBuf {
+		if err := s.Reconstruct(&resultRecords[i], r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if resultRecords[0].A != nil {
+		t.Fatal("expected null to sort first, but found", resultRecords)
+	}
+}
+
+func generateBenchmarkBufferRows(n int) (*parquet.Schema, []parquet.Row) {
+	model := new(benchmarkRowType)
+	schema := parquet.SchemaOf(model)
+	prng := rand.New(rand.NewSource(0))
+	rows := make([]parquet.Row, n)
+
+	for i := range rows {
+		io.ReadFull(prng, model.ID[:])
+		model.Value = prng.Float64()
+		rows[i] = make(parquet.Row, 0, 2)
+		rows[i] = schema.Deconstruct(rows[i], model)
+	}
+
+	return schema, rows
+}
+
+func BenchmarkBufferReadRows100x(b *testing.B) {
+	schema, rows := generateBenchmarkBufferRows(benchmarkNumRows)
+	buffer := parquet.NewBuffer(schema)
+
+	for i := 0; i < len(rows); i += benchmarkRowsPerStep {
+		j := i + benchmarkRowsPerStep
+		if _, err := buffer.WriteRows(rows[i:j]); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	bufferRows := buffer.Rows()
+	defer bufferRows.Close()
+
+	benchmarkRowsPerSecond(b, func() int {
+		n, err := bufferRows.ReadRows(rows[:benchmarkRowsPerStep])
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = bufferRows.SeekToRow(0)
+			}
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+		return n
+	})
+}
+
+func BenchmarkBufferWriteRows100x(b *testing.B) {
+	schema, rows := generateBenchmarkBufferRows(benchmarkNumRows)
+	buffer := parquet.NewBuffer(schema)
+
+	i := 0
+	benchmarkRowsPerSecond(b, func() int {
+		n, err := buffer.WriteRows(rows[i : i+benchmarkRowsPerStep])
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		i += benchmarkRowsPerStep
+		i %= benchmarkNumRows
+
+		if i == 0 {
+			buffer.Reset()
+		}
+		return n
+	})
 }

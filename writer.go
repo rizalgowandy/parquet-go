@@ -1,11 +1,13 @@
 package parquet
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/bits"
 	"sort"
 
 	"github.com/segmentio/encoding/thrift"
@@ -13,11 +15,10 @@ import (
 	"github.com/segmentio/parquet-go/encoding"
 	"github.com/segmentio/parquet-go/encoding/plain"
 	"github.com/segmentio/parquet-go/format"
-	"github.com/segmentio/parquet-go/internal/bits"
 )
 
-// A Writer uses a parquet schema and sequence of Go values to produce a parquet
-// file to an io.Writer.
+// Deprecated: A Writer uses a parquet schema and sequence of Go values to
+// produce a parquet file to an io.Writer.
 //
 // This example showcases a typical use of parquet writers:
 //
@@ -39,12 +40,15 @@ import (
 // entire row group. Programs that need to produce parquet files with sorted
 // row groups should use the Buffer type to buffer and sort the rows prior to
 // writing them to a Writer.
+//
+// For programs building with Go 1.18 or later, the GenericWriter[T] type
+// supersedes this one.
 type Writer struct {
 	output io.Writer
 	config *WriterConfig
 	schema *Schema
 	writer *writer
-	values []Value
+	rowbuf []Row
 }
 
 // NewWriter constructs a parquet writer writing a file to the given io.Writer.
@@ -63,7 +67,6 @@ type Writer struct {
 //		writer := parquet.NewWriter(output, config)
 //		...
 //	}
-//
 func NewWriter(output io.Writer, options ...WriterOption) *Writer {
 	config, err := NewWriterConfig(options...)
 	if err != nil {
@@ -101,6 +104,9 @@ func (w *Writer) Close() error {
 // Flush is called automatically on Close, it is only useful to call explicitly
 // if the application needs to limit the size of row groups or wants to produce
 // multiple row groups per file.
+//
+// If the writer attempts to create more than MaxRowGroups row groups the method
+// returns ErrTooManyRowGroups.
 func (w *Writer) Flush() error {
 	if w.writer != nil {
 		return w.writer.flush()
@@ -129,21 +135,27 @@ func (w *Writer) Write(row interface{}) error {
 	if w.schema == nil {
 		w.configure(SchemaOf(row))
 	}
-	defer func() {
-		clearValues(w.values)
-	}()
-	w.values = w.schema.Deconstruct(w.values[:0], row)
-	return w.WriteRow(w.values)
+	if cap(w.rowbuf) == 0 {
+		w.rowbuf = make([]Row, 1)
+	} else {
+		w.rowbuf = w.rowbuf[:1]
+	}
+	defer clearRows(w.rowbuf)
+	w.rowbuf[0] = w.schema.Deconstruct(w.rowbuf[0][:0], row)
+	_, err := w.WriteRows(w.rowbuf)
+	return err
 }
 
-// WriteRow is called to write another row to the parquet file.
+// WriteRows is called to write rows to the parquet file.
 //
 // The Writer must have been given a schema when NewWriter was called, otherwise
 // the structure of the parquet file cannot be determined from the row only.
 //
 // The row is expected to contain values for each column of the writer's schema,
 // in the order produced by the parquet.(*Schema).Deconstruct method.
-func (w *Writer) WriteRow(row Row) error { return w.writer.WriteRow(row) }
+func (w *Writer) WriteRows(rows []Row) (int, error) {
+	return w.writer.WriteRows(rows)
+}
 
 // WriteRowGroup writes a row group to the parquet file.
 //
@@ -165,8 +177,10 @@ func (w *Writer) WriteRowGroup(rowGroup RowGroup) (int64, error) {
 	if err := w.writer.flush(); err != nil {
 		return 0, err
 	}
-	w.writer.configureBloomFilters(rowGroup)
-	n, err := CopyRows(w.writer, rowGroup.Rows())
+	w.writer.configureBloomFilters(rowGroup.ColumnChunks())
+	rows := rowGroup.Rows()
+	defer rows.Close()
+	n, err := CopyRows(w.writer, rows)
 	if err != nil {
 		return n, err
 	}
@@ -184,8 +198,12 @@ func (w *Writer) ReadRowsFrom(rows RowReader) (written int64, err error) {
 			w.configure(r.Schema())
 		}
 	}
-	written, w.values, err = copyRows(w.writer, rows, w.values[:0])
-	return written, err
+	if cap(w.rowbuf) < defaultRowBufferSize {
+		w.rowbuf = make([]Row, defaultRowBufferSize)
+	} else {
+		w.rowbuf = w.rowbuf[:cap(w.rowbuf)]
+	}
+	return copyRows(w.writer, rows, w.rowbuf)
 }
 
 // Schema returns the schema of rows written by w.
@@ -193,46 +211,75 @@ func (w *Writer) ReadRowsFrom(rows RowReader) (written int64, err error) {
 // The returned value will be nil if no schema has yet been configured on w.
 func (w *Writer) Schema() *Schema { return w.schema }
 
+// SetKeyValueMetadata sets a key/value pair in the Parquet file metadata.
+//
+// Keys are assumed to be unique, if the same key is repeated multiple times the
+// last value is retained. While the parquet format does not require unique keys,
+// this design decision was made to optimize for the most common use case where
+// applications leverage this extension mechanism to associate single values to
+// keys. This may create incompatibilities with other parquet libraries, or may
+// cause some key/value pairs to be lost when open parquet files written with
+// repeated keys. We can revisit this decision if it ever becomes a blocker.
+func (w *Writer) SetKeyValueMetadata(key, value string) {
+	for i, kv := range w.writer.metadata {
+		if kv.Key == key {
+			kv.Value = value
+			w.writer.metadata[i] = kv
+			return
+		}
+	}
+	w.writer.metadata = append(w.writer.metadata, format.KeyValue{
+		Key:   key,
+		Value: value,
+	})
+}
+
 type writer struct {
-	writer offsetTrackingWriter
+	buffer  *bufio.Writer
+	writer  offsetTrackingWriter
+	values  [][]Value
+	numRows int64
+	maxRows int64
 
 	createdBy string
 	metadata  []format.KeyValue
 
-	buffers struct {
-		header bytes.Buffer
-		page   bytes.Buffer
-	}
-
-	columns       []*writerColumn
-	columnChunk   []format.ColumnChunk
-	columnIndex   []format.ColumnIndex
-	offsetIndex   []format.OffsetIndex
-	encodingStats [][]format.PageEncodingStats
+	columns     []*writerColumn
+	columnChunk []format.ColumnChunk
+	columnIndex []format.ColumnIndex
+	offsetIndex []format.OffsetIndex
 
 	columnOrders   []format.ColumnOrder
 	schemaElements []format.SchemaElement
 	rowGroups      []format.RowGroup
 	columnIndexes  [][]format.ColumnIndex
 	offsetIndexes  [][]format.OffsetIndex
+	sortingColumns []format.SortingColumn
 }
 
 func newWriter(output io.Writer, config *WriterConfig) *writer {
 	w := new(writer)
-	w.writer.Reset(output)
+	if config.WriteBufferSize <= 0 {
+		w.writer.Reset(output)
+	} else {
+		w.buffer = bufio.NewWriterSize(output, config.WriteBufferSize)
+		w.writer.Reset(w.buffer)
+	}
+	w.maxRows = config.MaxRowsPerRowGroup
 	w.createdBy = config.CreatedBy
 	w.metadata = make([]format.KeyValue, 0, len(config.KeyValueMetadata))
 	for k, v := range config.KeyValueMetadata {
 		w.metadata = append(w.metadata, format.KeyValue{Key: k, Value: v})
 	}
 	sortKeyValueMetadata(w.metadata)
+	w.sortingColumns = make([]format.SortingColumn, len(config.Sorting.SortingColumns))
 
 	config.Schema.forEachNode(func(name string, node Node) {
 		nodeType := node.Type()
 
 		repetitionType := (*format.FieldRepetitionType)(nil)
 		if node != config.Schema { // the root has no repetition type
-			repetitionType = fieldRepetitionTypeOf(node)
+			repetitionType = fieldRepetitionTypePtrOf(node)
 		}
 
 		// For backward compatibility with older readers, the parquet specification
@@ -251,11 +298,11 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 		}
 
 		w.schemaElements = append(w.schemaElements, format.SchemaElement{
-			Type:           nodeType.PhyiscalType(),
+			Type:           nodeType.PhysicalType(),
 			TypeLength:     typeLength,
 			RepetitionType: repetitionType,
 			Name:           name,
-			NumChildren:    int32(node.NumChildren()),
+			NumChildren:    int32(len(node.Fields())),
 			ConvertedType:  nodeType.ConvertedType(),
 			Scale:          scale,
 			Precision:      precision,
@@ -268,17 +315,39 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 		dataPageType = format.DataPageV2
 	}
 
+	defaultCompression := config.Compression
+	if defaultCompression == nil {
+		defaultCompression = &Uncompressed
+	}
+
+	// Those buffers are scratch space used to generate the page header and
+	// content, they are shared by all column chunks because they are only
+	// used during calls to writeDictionaryPage or writeDataPage, which are
+	// not done concurrently.
+	buffers := new(writerBuffers)
+
 	forEachLeafColumnOf(config.Schema, func(leaf leafColumn) {
-		encoding, compression := encodingAndCompressionOf(leaf.node)
+		encoding := encodingOf(leaf.node)
 		dictionary := Dictionary(nil)
 		columnType := leaf.node.Type()
+		columnIndex := int(leaf.columnIndex)
+		compression := leaf.node.Compression()
+
+		if compression == nil {
+			compression = defaultCompression
+		}
 
 		if isDictionaryEncoding(encoding) {
-			dictionary = columnType.NewDictionary(0)
+			dictBuffer := columnType.NewValues(
+				make([]byte, 0, defaultDictBufferSize),
+				nil,
+			)
+			dictionary = columnType.NewDictionary(columnIndex, 0, dictBuffer)
 			columnType = dictionary.Type()
 		}
 
 		c := &writerColumn{
+			buffers:            buffers,
 			pool:               config.ColumnPageBuffers,
 			columnPath:         leaf.path,
 			columnType:         columnType,
@@ -290,7 +359,7 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 			maxRepetitionLevel: leaf.maxRepetitionLevel,
 			maxDefinitionLevel: leaf.maxDefinitionLevel,
 			bufferIndex:        int32(leaf.columnIndex),
-			bufferSize:         int32(config.PageBufferSize),
+			bufferSize:         int32(float64(config.PageBufferSize) * 0.98),
 			writePageStats:     config.DataPageStatistics,
 			encodings:          make([]format.Encoding, 0, 3),
 			// Data pages in version 2 can omit compression when dictionary
@@ -298,27 +367,12 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 			// compressed, the data pages are encoded with the hybrid
 			// RLE/Bit-Pack encoding which doesn't benefit from an extra
 			// compression layer.
-			isCompressed: compression.CompressionCodec() != format.Uncompressed && (dataPageType != format.DataPageV2 || dictionary == nil),
+			isCompressed: isCompressed(compression) && (dataPageType != format.DataPageV2 || dictionary == nil),
 		}
 
-		// Those buffers are scratch space used to generate the page header and
-		// content, they are shared by all column chunks because they are only
-		// used during calls to writeDictionaryPage or writeDataPage, which are
-		// not done concurrently.
-		c.header.buffer, c.page.buffer = &w.buffers.header, &w.buffers.page
-		c.header.encoder.Reset(c.header.protocol.NewWriter(c.header.buffer))
-
-		if leaf.maxRepetitionLevel > 0 {
-			c.insert = (*writerColumn).insertRepeated
-			c.commit = (*writerColumn).commitRepeated
-			c.values = make([]Value, 0, 10)
-		} else {
-			c.insert = (*writerColumn).WriteRow
-			c.commit = func(*writerColumn) error { return nil }
-		}
+		c.header.encoder.Reset(c.header.protocol.NewWriter(&buffers.header))
 
 		if leaf.maxDefinitionLevel > 0 {
-			c.levels.encoder = RLE.NewEncoder(nil)
 			c.encodings = addEncoding(c.encodings, format.RLE)
 		}
 
@@ -326,13 +380,30 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 			c.encodings = addEncoding(c.encodings, format.Plain)
 		}
 
-		c.page.encoder = encoding.NewEncoder(nil)
-		c.page.encoding = encoding.Encoding()
-		c.encodings = addEncoding(c.encodings, c.page.encoding)
+		c.encoding = encoding
+		c.encodings = addEncoding(c.encodings, c.encoding.Encoding())
 		sortPageEncodings(c.encodings)
 
 		w.columns = append(w.columns, c)
+
+		if sortingIndex := searchSortingColumn(config.Sorting.SortingColumns, leaf.path); sortingIndex < len(w.sortingColumns) {
+			w.sortingColumns[sortingIndex] = format.SortingColumn{
+				ColumnIdx:  int32(leaf.columnIndex),
+				Descending: config.Sorting.SortingColumns[sortingIndex].Descending(),
+				NullsFirst: config.Sorting.SortingColumns[sortingIndex].NullsFirst(),
+			}
+		}
 	})
+
+	// Pre-allocate the backing array so that in most cases where the rows
+	// contain a single value we will hit collocated memory areas when writing
+	// rows to the writer. This won't benefit repeated columns much but in that
+	// case we would just waste a bit of memory which we can afford.
+	values := make([]Value, len(w.columns))
+	w.values = make([][]Value, len(w.columns))
+	for i := range values {
+		w.values[i] = values[i : i : i+1]
+	}
 
 	w.columnChunk = make([]format.ColumnChunk, len(w.columns))
 	w.columnIndex = make([]format.ColumnIndex, len(w.columns))
@@ -364,7 +435,12 @@ func newWriter(output io.Writer, config *WriterConfig) *writer {
 }
 
 func (w *writer) reset(writer io.Writer) {
-	w.writer.Reset(writer)
+	if w.buffer == nil {
+		w.writer.Reset(writer)
+	} else {
+		w.buffer.Reset(writer)
+		w.writer.Reset(w.buffer)
+	}
 	for _, c := range w.columns {
 		c.reset()
 	}
@@ -383,14 +459,19 @@ func (w *writer) reset(writer io.Writer) {
 }
 
 func (w *writer) close() error {
-	defer w.writer.Reset(nil)
 	if err := w.writeFileHeader(); err != nil {
 		return err
 	}
 	if err := w.flush(); err != nil {
 		return err
 	}
-	return w.writeFileFooter()
+	if err := w.writeFileFooter(); err != nil {
+		return err
+	}
+	if w.buffer != nil {
+		return w.buffer.Flush()
+	}
+	return nil
 }
 
 func (w *writer) flush() error {
@@ -409,10 +490,10 @@ func (w *writer) writeFileHeader() error {
 	return nil
 }
 
-func (w *writer) configureBloomFilters(rowGroup RowGroup) {
+func (w *writer) configureBloomFilters(columnChunks []ColumnChunk) {
 	for i, c := range w.columns {
 		if c.columnFilter != nil {
-			c.page.filter = c.newBloomFilterEncoder(rowGroup.Column(i).NumValues())
+			c.resizeBloomFilter(columnChunks[i].NumValues())
 		}
 	}
 }
@@ -490,7 +571,12 @@ func (w *writer) writeRowGroup(rowGroupSchema *Schema, rowGroupSortingColumns []
 		return 0, nil
 	}
 
+	if len(w.rowGroups) == MaxRowGroups {
+		return 0, ErrTooManyRowGroups
+	}
+
 	defer func() {
+		w.numRows = 0
 		for _, c := range w.columns {
 			c.reset()
 		}
@@ -514,7 +600,7 @@ func (w *writer) writeRowGroup(rowGroupSchema *Schema, rowGroupSortingColumns []
 	fileOffset := w.writer.offset
 
 	for _, c := range w.columns {
-		if c.page.filter != nil {
+		if len(c.filter) > 0 {
 			c.columnChunk.MetaData.BloomFilterOffset = w.writer.offset
 			if err := c.writeBloomFilter(&w.writer); err != nil {
 				return 0, err
@@ -555,8 +641,8 @@ func (w *writer) writeRowGroup(rowGroupSchema *Schema, rowGroupSortingColumns []
 		totalCompressedSize += int64(c.TotalCompressedSize)
 	}
 
-	sortingColumns := ([]format.SortingColumn)(nil)
-	if len(rowGroupSortingColumns) > 0 {
+	sortingColumns := w.sortingColumns
+	if len(sortingColumns) == 0 && len(rowGroupSortingColumns) > 0 {
 		sortingColumns = make([]format.SortingColumn, 0, len(rowGroupSortingColumns))
 		forEachLeafColumnOf(rowGroupSchema, func(leaf leafColumn) {
 			if sortingIndex := searchSortingColumn(rowGroupSortingColumns, leaf.path); sortingIndex < len(sortingColumns) {
@@ -578,6 +664,18 @@ func (w *writer) writeRowGroup(rowGroupSchema *Schema, rowGroupSortingColumns []
 	offsetIndex := make([]format.OffsetIndex, len(w.offsetIndex))
 	copy(offsetIndex, w.offsetIndex)
 
+	for i := range columns {
+		c := &columns[i]
+		c.MetaData.EncodingStats = make([]format.PageEncodingStats, len(c.MetaData.EncodingStats))
+		copy(c.MetaData.EncodingStats, w.columnChunk[i].MetaData.EncodingStats)
+	}
+
+	for i := range offsetIndex {
+		c := &offsetIndex[i]
+		c.PageLocations = make([]format.PageLocation, len(c.PageLocations))
+		copy(c.PageLocations, w.offsetIndex[i].PageLocations)
+	}
+
 	w.rowGroups = append(w.rowGroups, format.RowGroup{
 		Columns:             columns,
 		TotalByteSize:       totalByteSize,
@@ -593,19 +691,79 @@ func (w *writer) writeRowGroup(rowGroupSchema *Schema, rowGroupSortingColumns []
 	return numRows, nil
 }
 
-func (w *writer) WriteRow(row Row) error {
-	for i := range row {
-		c := w.columns[row[i].Column()]
-		if err := c.insert(c, row[i:i+1]); err != nil {
-			return err
+func (w *writer) WriteRows(rows []Row) (int, error) {
+	return w.writeRows(len(rows), func(start, end int) (int, error) {
+		defer func() {
+			for i, values := range w.values {
+				clearValues(values)
+				w.values[i] = values[:0]
+			}
+		}()
+
+		// TODO: if an error occurs in this method the writer may be left in an
+		// partially functional state. Applications are not expected to continue
+		// using the writer after getting an error, but maybe we could ensure that
+		// we are preventing further use as well?
+		for _, row := range rows[start:end] {
+			row.Range(func(columnIndex int, columnValues []Value) bool {
+				w.values[columnIndex] = append(w.values[columnIndex], columnValues...)
+				return true
+			})
+		}
+
+		for i, values := range w.values {
+			if len(values) > 0 {
+				if err := w.columns[i].writeRows(values); err != nil {
+					return 0, err
+				}
+			}
+		}
+
+		return end - start, nil
+	})
+}
+
+func (w *writer) writeRows(numRows int, write func(i, j int) (int, error)) (int, error) {
+	written := 0
+
+	for written < numRows {
+		remain := w.maxRows - w.numRows
+		length := numRows - written
+
+		if remain == 0 {
+			remain = w.maxRows
+
+			if err := w.flush(); err != nil {
+				return written, err
+			}
+		}
+
+		if remain < int64(length) {
+			length = int(remain)
+		}
+
+		// Since the writer cannot flush pages across row boundaries, calls to
+		// WriteRows with very large slices can result in greatly exceeding the
+		// target page size. To set a limit to the impact of these large writes
+		// we chunk the input in slices of 64 rows.
+		//
+		// Note that this mechanism isn't perfect; for example, values may hold
+		// large byte slices which could still cause the column buffers to grow
+		// beyond the target page size.
+		const maxRowsPerWrite = 64
+		if length > maxRowsPerWrite {
+			length = maxRowsPerWrite
+		}
+
+		n, err := write(written, written+length)
+		written += n
+		w.numRows += int64(n)
+		if err != nil {
+			return written, err
 		}
 	}
-	for _, c := range w.columns {
-		if err := c.commit(c); err != nil {
-			return err
-		}
-	}
-	return nil
+
+	return written, nil
 }
 
 // The WriteValues method is intended to work in pair with WritePage to allow
@@ -614,37 +772,61 @@ func (w *writer) WriteValues(values []Value) (numValues int, err error) {
 	return w.columns[values[0].Column()].WriteValues(values)
 }
 
-// This WritePage method satisfies the PageWriter interface as a mechanism to
-// allow writing whole pages of values instead of individual rows. It is called
-// indirectly by readers that implement WriteRowsTo and are able to leverage
-// the method to optimize writes.
-func (w *writer) WritePage(page Page) (int64, error) {
-	return w.columns[page.Column()].WritePage(page)
+// One writerBuffers is used by each writer instance, the memory buffers here
+// are shared by all columns of the writer because serialization is not done
+// concurrently, which helps keep memory utilization low, both in the total
+// footprint and GC cost.
+//
+// The type also exposes helper methods to facilitate the generation of parquet
+// pages. A scratch space is used when serialization requires combining multiple
+// buffers or compressing the page data, with double-buffering technique being
+// employed by swapping the scratch and page buffers to minimize memory copies.
+type writerBuffers struct {
+	header      bytes.Buffer // buffer where page headers are encoded
+	repetitions []byte       // buffer used to encode repetition levels
+	definitions []byte       // buffer used to encode definition levels
+	page        []byte       // page buffer holding the page data
+	scratch     []byte       // scratch space used for compression
 }
 
-type writerColumn struct {
-	insert func(*writerColumn, Row) error
-	commit func(*writerColumn) error
-	values []Value
-	filter []BufferedPage
+func (wb *writerBuffers) crc32() (checksum uint32) {
+	checksum = crc32.Update(checksum, crc32.IEEETable, wb.repetitions)
+	checksum = crc32.Update(checksum, crc32.IEEETable, wb.definitions)
+	checksum = crc32.Update(checksum, crc32.IEEETable, wb.page)
+	return checksum
+}
 
-	pool  PageBufferPool
-	pages []io.ReadWriter
+func (wb *writerBuffers) size() int {
+	return len(wb.repetitions) + len(wb.definitions) + len(wb.page)
+}
 
-	columnPath   columnPath
-	columnType   Type
-	columnIndex  ColumnIndexer
-	columnBuffer ColumnBuffer
-	columnFilter BloomFilterColumn
-	compression  compress.Codec
-	dictionary   Dictionary
+func (wb *writerBuffers) reset() {
+	wb.repetitions = wb.repetitions[:0]
+	wb.definitions = wb.definitions[:0]
+	wb.page = wb.page[:0]
+}
 
-	dataPageType       format.PageType
-	maxRepetitionLevel int8
-	maxDefinitionLevel int8
+func encodeLevels(dst, src []byte, maxLevel byte) ([]byte, error) {
+	bitWidth := bits.Len8(maxLevel)
+	return levelEncodingsRLE[bitWidth-1].EncodeLevels(dst, src)
+}
 
-	levels struct {
-		encoder encoding.Encoder
+func (wb *writerBuffers) encodeRepetitionLevels(page Page, maxRepetitionLevel byte) (err error) {
+	wb.repetitions, err = encodeLevels(wb.repetitions, page.RepetitionLevels(), maxRepetitionLevel)
+	return
+}
+
+func (wb *writerBuffers) encodeDefinitionLevels(page Page, maxDefinitionLevel byte) (err error) {
+	wb.definitions, err = encodeLevels(wb.definitions, page.DefinitionLevels(), maxDefinitionLevel)
+	return
+}
+
+func (wb *writerBuffers) prependLevelsToDataPageV1(maxRepetitionLevel, maxDefinitionLevel byte) {
+	hasRepetitionLevels := maxRepetitionLevel > 0
+	hasDefinitionLevels := maxDefinitionLevel > 0
+
+	if hasRepetitionLevels || hasDefinitionLevels {
+		wb.scratch = wb.scratch[:0]
 		// In data pages v1, the repetition and definition levels are prefixed
 		// with the 4 bytes length of the sections. While the parquet-format
 		// documentation indicates that the length prefix is part of the hybrid
@@ -653,31 +835,64 @@ type writerColumn struct {
 		// encoding.
 		//
 		// Reference https://github.com/apache/parquet-format/blob/master/Encodings.md#run-length-encoding--bit-packing-hybrid-rle--3
-		v1 lengthPrefixedWriter
+		if hasRepetitionLevels {
+			wb.scratch = plain.AppendInt32(wb.scratch, int32(len(wb.repetitions)))
+			wb.scratch = append(wb.scratch, wb.repetitions...)
+			wb.repetitions = wb.repetitions[:0]
+		}
+		if hasDefinitionLevels {
+			wb.scratch = plain.AppendInt32(wb.scratch, int32(len(wb.definitions)))
+			wb.scratch = append(wb.scratch, wb.definitions...)
+			wb.definitions = wb.definitions[:0]
+		}
+		wb.scratch = append(wb.scratch, wb.page...)
+		wb.swapPageAndScratchBuffers()
 	}
+}
+
+func (wb *writerBuffers) encode(page Page, enc encoding.Encoding) (err error) {
+	pageType := page.Type()
+	pageData := page.Data()
+	wb.page, err = pageType.Encode(wb.page[:0], pageData, enc)
+	return err
+}
+
+func (wb *writerBuffers) compress(codec compress.Codec) (err error) {
+	wb.scratch, err = codec.Encode(wb.scratch[:0], wb.page)
+	wb.swapPageAndScratchBuffers()
+	return err
+}
+
+func (wb *writerBuffers) swapPageAndScratchBuffers() {
+	wb.page, wb.scratch = wb.scratch, wb.page[:0]
+}
+
+type writerColumn struct {
+	pool  BufferPool
+	pages []io.ReadWriteSeeker
+
+	columnPath   columnPath
+	columnType   Type
+	columnIndex  ColumnIndexer
+	columnBuffer ColumnBuffer
+	columnFilter BloomFilterColumn
+	encoding     encoding.Encoding
+	compression  compress.Codec
+	dictionary   Dictionary
+
+	dataPageType       format.PageType
+	maxRepetitionLevel byte
+	maxDefinitionLevel byte
+
+	buffers *writerBuffers
 
 	header struct {
-		buffer   *bytes.Buffer
 		protocol thrift.CompactProtocol
 		encoder  thrift.Encoder
 	}
 
-	page struct {
-		buffer       *bytes.Buffer
-		filter       *bloomFilterEncoder
-		compressed   compress.Writer
-		uncompressed offsetTrackingWriter
-		encoding     format.Encoding
-		encoder      encoding.Encoder
-	}
-
-	dict struct {
-		encoder plain.Encoder
-	}
-
+	filter         []byte
 	numRows        int64
-	maxValues      int32
-	numValues      int32
 	bufferIndex    int32
 	bufferSize     int32
 	writePageStats bool
@@ -699,18 +914,16 @@ func (c *writerColumn) reset() {
 		c.dictionary.Reset()
 	}
 	for _, page := range c.pages {
-		c.pool.PutPageBuffer(page)
-	}
-	for i := range c.filter {
-		c.filter[i] = nil
+		c.pool.PutBuffer(page)
 	}
 	for i := range c.pages {
 		c.pages[i] = nil
 	}
-	c.filter = c.filter[:0]
 	c.pages = c.pages[:0]
+	// Bloom filters may change in size between row groups, but we retain the
+	// buffer to avoid reallocating large memory blocks.
+	c.filter = c.filter[:0]
 	c.numRows = 0
-	c.numValues = 0
 	// Reset the fields of column chunks that change between row groups,
 	// but keep the ones that remain unchanged.
 	c.columnChunk.MetaData.NumValues = 0
@@ -719,17 +932,9 @@ func (c *writerColumn) reset() {
 	c.columnChunk.MetaData.DataPageOffset = 0
 	c.columnChunk.MetaData.DictionaryPageOffset = 0
 	c.columnChunk.MetaData.Statistics = format.Statistics{}
-	c.columnChunk.MetaData.EncodingStats = make([]format.PageEncodingStats, 0, cap(c.columnChunk.MetaData.EncodingStats))
+	c.columnChunk.MetaData.EncodingStats = c.columnChunk.MetaData.EncodingStats[:0]
 	c.columnChunk.MetaData.BloomFilterOffset = 0
-	// Retain the previous capacity in the new page locations array, assuming
-	// the number of pages should be roughly the same between row groups written
-	// by the writer.
-	c.offsetIndex.PageLocations = make([]format.PageLocation, 0, cap(c.offsetIndex.PageLocations))
-	// Bloom filters may change in size between row groups; we may want to
-	// optimize this by retaining the filter and reusing it if needed, but
-	// for now we take the simpler approach of freeing it and having the
-	// write path lazily reallocate it if the writer is reused.
-	c.page.filter = nil
+	c.offsetIndex.PageLocations = c.offsetIndex.PageLocations[:0]
 }
 
 func (c *writerColumn) totalRowCount() int64 {
@@ -740,58 +945,123 @@ func (c *writerColumn) totalRowCount() int64 {
 	return n
 }
 
-func (c *writerColumn) canFlush() bool {
-	return c.columnBuffer.Size() >= int64(c.bufferSize/2)
-}
-
 func (c *writerColumn) flush() (err error) {
-	if c.numValues != 0 {
-		c.numValues = 0
+	if c.columnBuffer.Len() > 0 {
 		defer c.columnBuffer.Reset()
-		_, err = c.writeBufferedPage(c.columnBuffer.Page())
+		_, err = c.writeDataPage(c.columnBuffer.Page())
 	}
 	return err
 }
 
 func (c *writerColumn) flushFilterPages() error {
-	if c.columnFilter != nil {
-		numValues := int64(0)
-		for _, page := range c.filter {
-			numValues += page.NumValues()
+	if c.columnFilter == nil {
+		return nil
+	}
+
+	// If there is a dictionary, it contains all the values that we need to
+	// write to the filter.
+	if dict := c.dictionary; dict != nil {
+		// Need to always attempt to resize the filter, as the writer might
+		// be reused after resetting which would have reset the length of
+		// the filter to 0.
+		c.resizeBloomFilter(int64(dict.Len()))
+		return c.writePageToFilter(dict.Page())
+	}
+
+	// When the filter was already allocated, pages have been written to it as
+	// they were seen by the column writer.
+	if len(c.filter) > 0 {
+		return nil
+	}
+
+	// When the filter was not allocated, the writer did not know how many
+	// values were going to be seen and therefore could not properly size the
+	// filter ahead of time. In this case, we read back all the pages that we
+	// have encoded and copy their values back to the filter.
+	//
+	// A prior implementation of the column writer used to create in-memory
+	// copies of the pages to avoid this decoding step; however, this unbounded
+	// allocation caused memory exhaustion in production applications. CPU being
+	// a somewhat more stretchable resource, we prefer spending time on this
+	// decoding step than having to trigger incident response when production
+	// systems are getting OOM-Killed.
+	c.resizeBloomFilter(c.columnChunk.MetaData.NumValues)
+
+	column := &Column{
+		// Set all the fields required by the decodeDataPage* methods.
+		typ:                c.columnType,
+		encoding:           c.encoding,
+		compression:        c.compression,
+		maxRepetitionLevel: c.maxRepetitionLevel,
+		maxDefinitionLevel: c.maxDefinitionLevel,
+		index:              int16(c.bufferIndex),
+	}
+
+	rbuf, pool := getBufioReader(nil, 1024)
+	pbuf := (*buffer)(nil)
+	defer func() {
+		putBufioReader(rbuf, pool)
+		if pbuf != nil {
+			pbuf.unref()
 		}
-		if c.page.filter == nil {
-			c.page.filter = c.newBloomFilterEncoder(numValues)
+	}()
+
+	decoder := thrift.NewDecoder(c.header.protocol.NewReader(rbuf))
+
+	for _, p := range c.pages {
+		rbuf.Reset(p)
+
+		header := new(format.PageHeader)
+		if err := decoder.Decode(header); err != nil {
+			return err
 		}
 
-		// If there is a dictionary, we need to only write the dictionary.
-		if dict := c.dictionary; dict != nil {
-			return dict.WriteTo(c.page.filter)
+		if pbuf != nil {
+			pbuf.unref()
+		}
+		pbuf = buffers.get(int(header.CompressedPageSize))
+		if _, err := io.ReadFull(rbuf, pbuf.data); err != nil {
+			return err
+		}
+		if _, err := p.Seek(0, io.SeekStart); err != nil {
+			return err
 		}
 
-		for _, page := range c.filter {
-			if err := page.WriteTo(c.page.filter); err != nil {
-				return err
-			}
+		var page Page
+		var err error
+
+		switch header.Type {
+		case format.DataPage:
+			page, err = column.decodeDataPageV1(DataPageHeaderV1{header.DataPageHeader}, pbuf, nil, header.UncompressedPageSize)
+		case format.DataPageV2:
+			page, err = column.decodeDataPageV2(DataPageHeaderV2{header.DataPageHeaderV2}, pbuf, nil, header.UncompressedPageSize)
+		}
+		if page != nil {
+			err = c.writePageToFilter(page)
+			Release(page)
+		}
+		if err != nil {
+			return err
 		}
 	}
+
 	return nil
 }
 
-func (c *writerColumn) insertRepeated(row Row) error {
-	c.values = append(c.values, row...)
-	return nil
-}
-
-func (c *writerColumn) commitRepeated() error {
-	defer func() {
-		clearValues(c.values)
-		c.values = c.values[:0]
-	}()
-	return c.WriteRow(c.values)
+func (c *writerColumn) resizeBloomFilter(numValues int64) {
+	filterSize := c.columnFilter.Size(numValues)
+	if cap(c.filter) < filterSize {
+		c.filter = make([]byte, filterSize)
+	} else {
+		c.filter = c.filter[:filterSize]
+		for i := range c.filter {
+			c.filter[i] = 0
+		}
+	}
 }
 
 func (c *writerColumn) newColumnBuffer() ColumnBuffer {
-	column := c.columnType.NewColumnBuffer(int(c.bufferIndex), int(c.bufferSize))
+	column := c.columnType.NewColumnBuffer(int(c.bufferIndex), c.columnType.EstimateNumValues(int(c.bufferSize)))
 	switch {
 	case c.maxRepetitionLevel > 0:
 		column = newRepeatedColumnBuffer(column, c.maxRepetitionLevel, c.maxDefinitionLevel, nullsGoLast)
@@ -801,180 +1071,78 @@ func (c *writerColumn) newColumnBuffer() ColumnBuffer {
 	return column
 }
 
-func (c *writerColumn) newBloomFilterEncoder(numRows int64) *bloomFilterEncoder {
-	const bitsPerValue = 10 // TODO: make this configurable
-	return newBloomFilterEncoder(
-		c.columnFilter.NewFilter(numRows, bitsPerValue),
-		c.columnFilter.Hash(),
-	)
-}
-
-func (c *writerColumn) WriteRow(row Row) error {
+func (c *writerColumn) writeRows(rows []Value) error {
 	if c.columnBuffer == nil {
 		// Lazily create the row group column so we don't need to allocate it if
 		// rows are not written individually to the column.
 		c.columnBuffer = c.newColumnBuffer()
-		c.maxValues = int32(c.columnBuffer.Cap())
 	}
-
-	if c.numValues > 0 && c.numValues > (c.maxValues-int32(len(row))) {
-		if err := c.flush(); err != nil {
-			return err
-		}
-	}
-
-	if err := c.columnBuffer.WriteRow(row); err != nil {
+	if _, err := c.columnBuffer.WriteValues(rows); err != nil {
 		return err
 	}
-	c.numValues += int32(len(row))
+	if c.columnBuffer.Size() >= int64(c.bufferSize) {
+		return c.flush()
+	}
 	return nil
 }
 
 func (c *writerColumn) WriteValues(values []Value) (numValues int, err error) {
 	if c.columnBuffer == nil {
 		c.columnBuffer = c.newColumnBuffer()
-		c.maxValues = int32(c.columnBuffer.Cap())
 	}
-	numValues, err = c.columnBuffer.WriteValues(values)
-	c.numValues += int32(numValues)
-	return numValues, err
-}
-
-func (c *writerColumn) WritePage(page Page) (numValues int64, err error) {
-	// Page write optimizations are only available the column is not reindexing
-	// the values. If a dictionary is present, the column needs to see each
-	// individual value in order to re-index them in the dictionary.
-	if c.dictionary == nil || c.dictionary == page.Dictionary() {
-		// If the column had buffered values, we continue writing values from
-		// the page into the column buffer if it would have caused producing a
-		// page less than half the size of the target; if there were enough
-		// buffered values already, we have to flush the buffered page instead
-		// otherwise values would get reordered.
-		if c.numValues > 0 && c.canFlush() {
-			if err := c.flush(); err != nil {
-				return 0, err
-			}
-		}
-
-		// If we were successful at flushing buffered values, we attempt to
-		// optimize the write path by copying whole pages without decoding them
-		// into a sequence of values.
-		if c.numValues == 0 {
-			switch p := page.(type) {
-			case BufferedPage:
-				// Buffered pages may be larger than the target page size on the
-				// column, in which case multiple pages get written by slicing
-				// the original page into sub-pages.
-				err = forEachPageSlice(p, int64(c.bufferSize), func(p BufferedPage) error {
-					n, err := c.writeBufferedPage(p)
-					numValues += n
-					return err
-				})
-				return numValues, err
-
-			case CompressedPage:
-				// Compressed pages are written as-is to the compressed page
-				// buffers; those pages should be coming from parquet files that
-				// are being copied into a new file, they are simply copied to
-				// amortize the cost of decoding and re-encoding the pages, which
-				// often includes costly compression steps.
-				return c.writeCompressedPage(p)
-			}
-		}
-	}
-
-	// Pages that implement neither of those interfaces can still be
-	// written by copying their values into the column buffer and flush
-	// them to compressed page buffers as if the program had written
-	// rows individually.
-	return c.writePageValues(page.Values())
-}
-
-func (c *writerColumn) writePageValues(page ValueReader) (numValues int64, err error) {
-	numValues, err = CopyValues(c, page)
-	if err == nil && c.canFlush() {
-		// Always attempt to flush after writing a full page if we have enough
-		// buffered values; the intent is to leave the column clean so that
-		// subsequent calls to the WritePage method can use optimized write path
-		// to bypass buffering.
-		err = c.flush()
-	}
-	return numValues, err
+	return c.columnBuffer.WriteValues(values)
 }
 
 func (c *writerColumn) writeBloomFilter(w io.Writer) error {
 	e := thrift.NewEncoder(c.header.protocol.NewWriter(w))
 	h := bloomFilterHeader(c.columnFilter)
-	b := c.page.filter.Bytes()
-	h.NumBytes = int32(len(b))
+	h.NumBytes = int32(len(c.filter))
 	if err := e.Encode(&h); err != nil {
 		return err
 	}
-	_, err := w.Write(b)
+	_, err := w.Write(c.filter)
 	return err
 }
 
-func (c *writerColumn) writeBufferedPage(page BufferedPage) (int64, error) {
+func (c *writerColumn) writeDataPage(page Page) (int64, error) {
 	numValues := page.NumValues()
 	if numValues == 0 {
 		return 0, nil
 	}
 
-	c.page.buffer.Reset()
-	repetitionLevelsByteLength := int32(0)
-	definitionLevelsByteLength := int32(0)
+	buf := c.buffers
+	buf.reset()
 
-	if c.dataPageType == format.DataPageV2 {
-		if c.maxRepetitionLevel > 0 {
-			c.page.uncompressed.Reset(c.page.buffer)
-			c.levels.encoder.Reset(&c.page.uncompressed)
-			c.levels.encoder.SetBitWidth(bits.Len8(c.maxRepetitionLevel))
-			c.levels.encoder.EncodeInt8(page.RepetitionLevels())
-			repetitionLevelsByteLength = int32(c.page.uncompressed.offset)
-		}
-		if c.maxDefinitionLevel > 0 {
-			c.page.uncompressed.Reset(c.page.buffer)
-			c.levels.encoder.Reset(&c.page.uncompressed)
-			c.levels.encoder.SetBitWidth(bits.Len8(c.maxDefinitionLevel))
-			c.levels.encoder.EncodeInt8(page.DefinitionLevels())
-			definitionLevelsByteLength = int32(c.page.uncompressed.offset)
-		}
+	if c.maxRepetitionLevel > 0 {
+		buf.encodeRepetitionLevels(page, c.maxRepetitionLevel)
+	}
+	if c.maxDefinitionLevel > 0 {
+		buf.encodeDefinitionLevels(page, c.maxDefinitionLevel)
 	}
 
-	if !c.isCompressed {
-		c.page.uncompressed.Reset(c.page.buffer)
-	} else {
-		p, err := c.compressedPage(c.page.buffer)
-		if err != nil {
-			return 0, err
-		}
-		c.page.uncompressed.Reset(p)
+	if err := buf.encode(page, c.encoding); err != nil {
+		return 0, fmt.Errorf("encoding parquet data page: %w", err)
 	}
-
 	if c.dataPageType == format.DataPage {
-		if c.maxRepetitionLevel > 0 {
-			c.levels.v1.Reset(&c.page.uncompressed)
-			c.levels.encoder.Reset(&c.levels.v1)
-			c.levels.encoder.SetBitWidth(bits.Len8(c.maxRepetitionLevel))
-			c.levels.encoder.EncodeInt8(page.RepetitionLevels())
-			c.levels.v1.Close()
-		}
-		if c.maxDefinitionLevel > 0 {
-			c.levels.v1.Reset(&c.page.uncompressed)
-			c.levels.encoder.Reset(&c.levels.v1)
-			c.levels.encoder.SetBitWidth(bits.Len8(c.maxDefinitionLevel))
-			c.levels.encoder.EncodeInt8(page.DefinitionLevels())
-			c.levels.v1.Close()
+		buf.prependLevelsToDataPageV1(c.maxDefinitionLevel, c.maxDefinitionLevel)
+	}
+
+	uncompressedPageSize := buf.size()
+	if c.isCompressed {
+		if err := buf.compress(c.compression); err != nil {
+			return 0, fmt.Errorf("compressing parquet data page: %w", err)
 		}
 	}
 
-	switch {
-	case c.page.filter != nil:
-		if err := page.WriteTo(c.page.filter); err != nil {
+	if page.Dictionary() == nil && len(c.filter) > 0 {
+		// When the writer knows the number of values in advance (e.g. when
+		// writing a full row group), the filter encoding is set and the page
+		// can be directly applied to the filter, which minimizes memory usage
+		// since there is no need to buffer the values in order to determine
+		// the size of the filter.
+		if err := c.writePageToFilter(page); err != nil {
 			return 0, err
 		}
-	case c.columnFilter != nil:
-		c.filter = append(c.filter, page.Clone())
 	}
 
 	statistics := format.Statistics{}
@@ -982,26 +1150,11 @@ func (c *writerColumn) writeBufferedPage(page BufferedPage) (int64, error) {
 		statistics = c.makePageStatistics(page)
 	}
 
-	c.page.encoder.Reset(&c.page.uncompressed)
-	if err := page.WriteTo(c.page.encoder); err != nil {
-		return 0, err
-	}
-	if c.page.compressed != nil {
-		if err := c.page.compressed.Close(); err != nil {
-			return 0, err
-		}
-	}
-
-	c.header.buffer.Reset()
-	levelsByteLength := repetitionLevelsByteLength + definitionLevelsByteLength
-	uncompressedPageSize := c.page.uncompressed.offset + int64(levelsByteLength)
-	compressedPageSize := c.page.buffer.Len()
-
 	pageHeader := &format.PageHeader{
 		Type:                 c.dataPageType,
 		UncompressedPageSize: int32(uncompressedPageSize),
-		CompressedPageSize:   int32(compressedPageSize),
-		CRC:                  int32(crc32.ChecksumIEEE(c.page.buffer.Bytes())),
+		CompressedPageSize:   int32(buf.size()),
+		CRC:                  int32(buf.crc32()),
 	}
 
 	numRows := page.NumRows()
@@ -1010,7 +1163,7 @@ func (c *writerColumn) writeBufferedPage(page BufferedPage) (int64, error) {
 	case format.DataPage:
 		pageHeader.DataPageHeader = &format.DataPageHeader{
 			NumValues:               int32(numValues),
-			Encoding:                c.page.encoding,
+			Encoding:                c.encoding.Encoding(),
 			DefinitionLevelEncoding: format.RLE,
 			RepetitionLevelEncoding: format.RLE,
 			Statistics:              statistics,
@@ -1020,123 +1173,67 @@ func (c *writerColumn) writeBufferedPage(page BufferedPage) (int64, error) {
 			NumValues:                  int32(numValues),
 			NumNulls:                   int32(numNulls),
 			NumRows:                    int32(numRows),
-			Encoding:                   c.page.encoding,
-			DefinitionLevelsByteLength: definitionLevelsByteLength,
-			RepetitionLevelsByteLength: repetitionLevelsByteLength,
+			Encoding:                   c.encoding.Encoding(),
+			DefinitionLevelsByteLength: int32(len(buf.definitions)),
+			RepetitionLevelsByteLength: int32(len(buf.repetitions)),
 			IsCompressed:               &c.isCompressed,
 			Statistics:                 statistics,
 		}
 	}
 
+	buf.header.Reset()
 	if err := c.header.encoder.Encode(pageHeader); err != nil {
 		return 0, err
 	}
-	headerSize := int32(c.header.buffer.Len())
-	compressedSize := int64(headerSize) + int64(compressedPageSize)
-	if err := c.writePage(compressedSize, c.header.buffer, c.page.buffer); err != nil {
+
+	size := int64(buf.header.Len()) +
+		int64(len(buf.repetitions)) +
+		int64(len(buf.definitions)) +
+		int64(len(buf.page))
+
+	err := c.writePageTo(size, func(output io.Writer) (written int64, err error) {
+		for _, data := range [...][]byte{
+			buf.header.Bytes(),
+			buf.repetitions,
+			buf.definitions,
+			buf.page,
+		} {
+			wn, err := output.Write(data)
+			written += int64(wn)
+			if err != nil {
+				return written, err
+			}
+		}
+		return written, nil
+	})
+	if err != nil {
 		return 0, err
 	}
-	c.recordPageStats(headerSize, pageHeader, page)
+
+	c.recordPageStats(int32(buf.header.Len()), pageHeader, page)
 	return numValues, nil
 }
 
-func (c *writerColumn) writeCompressedPage(page CompressedPage) (int64, error) {
-	switch {
-	case c.page.filter != nil:
-		// TODO: modify the Buffer method to accept some kind of buffer pool as
-		// argument so we can use a pre-allocated page buffer to load the page
-		// and reduce the memory footprint.
-		bufferedPage := page.Buffer()
-		// The compressed page must be decompressed here in order to generate
-		// the bloom filter. Note that we don't re-compress it which still saves
-		// most of the compute cost (compression algorithms are usually designed
-		// to make decompressing much cheaper than compressing since it happens
-		// more often).
-		if err := bufferedPage.WriteTo(c.page.filter); err != nil {
-			return 0, err
-		}
-	case c.columnFilter != nil:
-		// When a column filter is configured but no page filter was allocated,
-		// we need to buffer the page in order to have access to the number of
-		// values and properly size the bloom filter when writing the row group.
-		c.filter = append(c.filter, page.Buffer())
-	}
+func (c *writerColumn) writeDictionaryPage(output io.Writer, dict Dictionary) (err error) {
+	buf := c.buffers
+	buf.reset()
 
-	pageHeader := &format.PageHeader{
-		UncompressedPageSize: int32(page.Size()),
-		CompressedPageSize:   int32(page.PageSize()),
-		CRC:                  int32(page.CRC()),
-	}
-
-	switch h := page.PageHeader().(type) {
-	case DataPageHeaderV1:
-		pageHeader.DataPageHeader = h.header
-	case DataPageHeaderV2:
-		pageHeader.DataPageHeaderV2 = h.header
-	default:
-		return 0, fmt.Errorf("writing compressed page type of unknown type: %s", h.PageType())
-	}
-
-	c.header.buffer.Reset()
-	if err := c.header.encoder.Encode(pageHeader); err != nil {
-		return 0, err
-	}
-	headerSize := int32(c.header.buffer.Len())
-	compressedSize := int64(headerSize + pageHeader.CompressedPageSize)
-	if err := c.writePage(compressedSize, c.header.buffer, page.PageData()); err != nil {
-		return 0, err
-	}
-	c.recordPageStats(headerSize, pageHeader, page)
-	return page.NumValues(), nil
-}
-
-func (c *writerColumn) writePage(size int64, header, data io.Reader) error {
-	buffer := c.pool.GetPageBuffer()
-	defer func() {
-		if buffer != nil {
-			c.pool.PutPageBuffer(buffer)
-		}
-	}()
-	headerSize, err := io.Copy(buffer, header)
-	if err != nil {
-		return err
-	}
-	dataSize, err := io.Copy(buffer, data)
-	if err != nil {
-		return err
-	}
-	written := headerSize + dataSize
-	if size != written {
-		return fmt.Errorf("writing parquet colum page expected %dB but got %dB: %w", size, written, io.ErrShortWrite)
-	}
-	c.pages = append(c.pages, buffer)
-	buffer = nil
-	return nil
-}
-
-func (c *writerColumn) writeDictionaryPage(output io.Writer, dict Dictionary) error {
-	c.page.buffer.Reset()
-
-	p, err := c.compressedPage(c.page.buffer)
-	if err != nil {
-		return err
-	}
-
-	c.page.uncompressed.Reset(p)
-	c.dict.encoder.Reset(&c.page.uncompressed)
-
-	if err := dict.WriteTo(&c.dict.encoder); err != nil {
+	if err := buf.encode(dict.Page(), &Plain); err != nil {
 		return fmt.Errorf("writing parquet dictionary page: %w", err)
 	}
-	if err := p.Close(); err != nil {
-		return fmt.Errorf("flushing compressed parquet dictionary page: %w", err)
+
+	uncompressedPageSize := buf.size()
+	if isCompressed(c.compression) {
+		if err := buf.compress(c.compression); err != nil {
+			return fmt.Errorf("copmressing parquet dictionary page: %w", err)
+		}
 	}
 
 	pageHeader := &format.PageHeader{
 		Type:                 format.DictionaryPage,
-		UncompressedPageSize: int32(c.page.uncompressed.offset),
-		CompressedPageSize:   int32(c.page.buffer.Len()),
-		CRC:                  int32(crc32.ChecksumIEEE(c.page.buffer.Bytes())),
+		UncompressedPageSize: int32(uncompressedPageSize),
+		CompressedPageSize:   int32(buf.size()),
+		CRC:                  int32(buf.crc32()),
 		DictionaryPageHeader: &format.DictionaryPageHeader{
 			NumValues: int32(dict.Len()),
 			Encoding:  format.Plain,
@@ -1144,38 +1241,56 @@ func (c *writerColumn) writeDictionaryPage(output io.Writer, dict Dictionary) er
 		},
 	}
 
-	c.header.buffer.Reset()
+	header := &c.buffers.header
+	header.Reset()
 	if err := c.header.encoder.Encode(pageHeader); err != nil {
 		return err
 	}
-	if _, err := output.Write(c.header.buffer.Bytes()); err != nil {
+	if _, err := output.Write(header.Bytes()); err != nil {
 		return err
 	}
-	if _, err := output.Write(c.page.buffer.Bytes()); err != nil {
+	if _, err := output.Write(buf.page); err != nil {
 		return err
 	}
-	c.recordPageStats(int32(c.header.buffer.Len()), pageHeader, nil)
+	c.recordPageStats(int32(header.Len()), pageHeader, nil)
 	return nil
 }
 
-func (c *writerColumn) compressedPage(w io.Writer) (compress.Writer, error) {
-	if c.page.compressed == nil {
-		z, err := c.compression.NewWriter(w)
-		if err != nil {
-			return nil, fmt.Errorf("creating compressor for parquet column chunk writer: %w", err)
+func (w *writerColumn) writePageToFilter(page Page) (err error) {
+	pageType := page.Type()
+	pageData := page.Data()
+	w.filter, err = pageType.Encode(w.filter, pageData, w.columnFilter.Encoding())
+	return err
+}
+
+func (c *writerColumn) writePageTo(size int64, writeTo func(io.Writer) (int64, error)) error {
+	buffer := c.pool.GetBuffer()
+	defer func() {
+		if buffer != nil {
+			c.pool.PutBuffer(buffer)
 		}
-		c.page.compressed = z
-	} else {
-		if err := c.page.compressed.Reset(w); err != nil {
-			return nil, fmt.Errorf("resetting compressor for parquet column chunk writer: %w", err)
-		}
+	}()
+	written, err := writeTo(buffer)
+	if err != nil {
+		return err
 	}
-	return c.page.compressed, nil
+	if written != size {
+		return fmt.Errorf("writing parquet column page expected %dB but got %dB: %w", size, written, io.ErrShortWrite)
+	}
+	offset, err := buffer.Seek(0, io.SeekStart)
+	if err != nil {
+		return err
+	}
+	if offset != 0 {
+		return fmt.Errorf("resetting parquet page buffer to the start expected offset zero but got %d", offset)
+	}
+	c.pages, buffer = append(c.pages, buffer), nil
+	return nil
 }
 
 func (c *writerColumn) makePageStatistics(page Page) format.Statistics {
 	numNulls := page.NumNulls()
-	minValue, maxValue := page.Bounds()
+	minValue, maxValue, _ := page.Bounds()
 	minValueBytes := minValue.Bytes()
 	maxValueBytes := maxValue.Bytes()
 	return format.Statistics{
@@ -1194,9 +1309,27 @@ func (c *writerColumn) recordPageStats(headerSize int32, header *format.PageHead
 	if page != nil {
 		numNulls := page.NumNulls()
 		numValues := page.NumValues()
-		minValue, maxValue := page.Bounds()
+		minValue, maxValue, pageHasBounds := page.Bounds()
 		c.columnIndex.IndexPage(numValues, numNulls, minValue, maxValue)
 		c.columnChunk.MetaData.NumValues += numValues
+		c.columnChunk.MetaData.Statistics.NullCount += numNulls
+
+		if pageHasBounds {
+			var existingMaxValue, existingMinValue Value
+
+			if c.columnChunk.MetaData.Statistics.MaxValue != nil && c.columnChunk.MetaData.Statistics.MinValue != nil {
+				existingMaxValue = c.columnType.Kind().Value(c.columnChunk.MetaData.Statistics.MaxValue)
+				existingMinValue = c.columnType.Kind().Value(c.columnChunk.MetaData.Statistics.MinValue)
+			}
+
+			if existingMaxValue.isNull() || c.columnType.Compare(maxValue, existingMaxValue) > 0 {
+				c.columnChunk.MetaData.Statistics.MaxValue = maxValue.Bytes()
+			}
+
+			if existingMinValue.isNull() || c.columnType.Compare(minValue, existingMinValue) < 0 {
+				c.columnChunk.MetaData.Statistics.MinValue = minValue.Bytes()
+			}
+		}
 
 		c.offsetIndex.PageLocations = append(c.offsetIndex.PageLocations, format.PageLocation{
 			Offset:             c.columnChunk.MetaData.TotalCompressedSize,
@@ -1267,31 +1400,6 @@ func sortPageEncodingStats(stats []format.PageEncodingStats) {
 	})
 }
 
-type lengthPrefixedWriter struct {
-	writer io.Writer
-	buffer []byte
-}
-
-func (w *lengthPrefixedWriter) Reset(ww io.Writer) {
-	w.writer = ww
-	w.buffer = append(w.buffer[:0], 0, 0, 0, 0)
-}
-
-func (w *lengthPrefixedWriter) Close() error {
-	if len(w.buffer) > 0 {
-		defer func() { w.buffer = w.buffer[:0] }()
-		binary.LittleEndian.PutUint32(w.buffer, uint32(len(w.buffer))-4)
-		_, err := w.writer.Write(w.buffer)
-		return err
-	}
-	return nil
-}
-
-func (w *lengthPrefixedWriter) Write(b []byte) (int, error) {
-	w.buffer = append(w.buffer, b...)
-	return len(b), nil
-}
-
 type offsetTrackingWriter struct {
 	writer io.Writer
 	offset int64
@@ -1314,16 +1422,23 @@ func (w *offsetTrackingWriter) WriteString(s string) (int, error) {
 	return n, err
 }
 
+func (w *offsetTrackingWriter) ReadFrom(r io.Reader) (int64, error) {
+	// io.Copy will make use of io.ReaderFrom if w.writer implements it.
+	n, err := io.Copy(w.writer, r)
+	w.offset += n
+	return n, err
+}
+
 var (
 	_ RowWriterWithSchema = (*Writer)(nil)
 	_ RowReaderFrom       = (*Writer)(nil)
 	_ RowGroupWriter      = (*Writer)(nil)
 
 	_ RowWriter   = (*writer)(nil)
-	_ PageWriter  = (*writer)(nil)
 	_ ValueWriter = (*writer)(nil)
 
-	_ RowWriter   = (*writerColumn)(nil)
-	_ PageWriter  = (*writerColumn)(nil)
 	_ ValueWriter = (*writerColumn)(nil)
+
+	_ io.ReaderFrom   = (*offsetTrackingWriter)(nil)
+	_ io.StringWriter = (*offsetTrackingWriter)(nil)
 )

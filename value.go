@@ -8,10 +8,13 @@ import (
 	"math"
 	"reflect"
 	"strconv"
+	"time"
 	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/segmentio/parquet-go/deprecated"
+	"github.com/segmentio/parquet-go/format"
+	"github.com/segmentio/parquet-go/internal/unsafecast"
 )
 
 const (
@@ -34,8 +37,8 @@ type Value struct {
 	// type
 	kind int8 // XOR(Kind) so the zero-value is <null>
 	// levels
-	definitionLevel int8
-	repetitionLevel int8
+	definitionLevel byte
+	repetitionLevel byte
 	columnIndex     int16 // XOR so the zero-value is -1
 }
 
@@ -45,6 +48,12 @@ type ValueReader interface {
 	// Read values into the buffer passed as argument and return the number of
 	// values read. When all values have been read, the error will be io.EOF.
 	ReadValues([]Value) (int, error)
+}
+
+// ValueReaderAt is an interface implemented by types that support reading
+// values at offsets specified by the application.
+type ValueReaderAt interface {
+	ReadValuesAt([]Value, int64) (int, error)
 }
 
 // ValueReaderFrom is an interface implemented by value writers to read values
@@ -66,6 +75,16 @@ type ValueWriter interface {
 type ValueWriterTo interface {
 	WriteValuesTo(ValueWriter) (int64, error)
 }
+
+// ValueReaderFunc is a function type implementing the ValueReader interface.
+type ValueReaderFunc func([]Value) (int, error)
+
+func (f ValueReaderFunc) ReadValues(values []Value) (int, error) { return f(values) }
+
+// ValueWriterFunc is a function type implementing the ValueWriter interface.
+type ValueWriterFunc func([]Value) (int, error)
+
+func (f ValueWriterFunc) WriteValues(values []Value) (int, error) { return f(values) }
 
 // CopyValues copies values from src to dst, returning the number of values
 // that were written.
@@ -151,6 +170,9 @@ func copyValues(dst ValueWriter, src ValueReader, buf []Value) (written int64, e
 //
 // The function panics if the Go value cannot be represented in parquet.
 func ValueOf(v interface{}) Value {
+	k := Kind(-1)
+	t := reflect.TypeOf(v)
+
 	switch value := v.(type) {
 	case nil:
 		return Value{}
@@ -158,10 +180,9 @@ func ValueOf(v interface{}) Value {
 		return makeValueBytes(FixedLenByteArray, value[:])
 	case deprecated.Int96:
 		return makeValueInt96(value)
+	case time.Time:
+		k = Int64
 	}
-
-	k := Kind(-1)
-	t := reflect.TypeOf(v)
 
 	switch t.Kind() {
 	case reflect.Bool:
@@ -190,10 +211,68 @@ func ValueOf(v interface{}) Value {
 		panic("cannot create parquet value from go value of type " + t.String())
 	}
 
-	return makeValue(k, reflect.ValueOf(v))
+	return makeValue(k, nil, reflect.ValueOf(v))
 }
 
-func makeValue(k Kind, v reflect.Value) Value {
+// NulLValue constructs a null value, which is the zero-value of the Value type.
+func NullValue() Value { return Value{} }
+
+// ZeroValue constructs a zero value of the given kind.
+func ZeroValue(kind Kind) Value { return makeValueKind(kind) }
+
+// BooleanValue constructs a BOOLEAN parquet value from the bool passed as
+// argument.
+func BooleanValue(value bool) Value { return makeValueBoolean(value) }
+
+// Int32Value constructs a INT32 parquet value from the int32 passed as
+// argument.
+func Int32Value(value int32) Value { return makeValueInt32(value) }
+
+// Int64Value constructs a INT64 parquet value from the int64 passed as
+// argument.
+func Int64Value(value int64) Value { return makeValueInt64(value) }
+
+// Int96Value constructs a INT96 parquet value from the deprecated.Int96 passed
+// as argument.
+func Int96Value(value deprecated.Int96) Value { return makeValueInt96(value) }
+
+// FloatValue constructs a FLOAT parquet value from the float32 passed as
+// argument.
+func FloatValue(value float32) Value { return makeValueFloat(value) }
+
+// DoubleValue constructs a DOUBLE parquet value from the float64 passed as
+// argument.
+func DoubleValue(value float64) Value { return makeValueDouble(value) }
+
+// ByteArrayValue constructs a BYTE_ARRAY parquet value from the byte slice
+// passed as argument.
+func ByteArrayValue(value []byte) Value { return makeValueBytes(ByteArray, value) }
+
+// FixedLenByteArrayValue constructs a BYTE_ARRAY parquet value from the byte
+// slice passed as argument.
+func FixedLenByteArrayValue(value []byte) Value { return makeValueBytes(FixedLenByteArray, value) }
+
+func makeValue(k Kind, lt *format.LogicalType, v reflect.Value) Value {
+	switch v.Type() {
+	case reflect.TypeOf(time.Time{}):
+		unit := Nanosecond.TimeUnit()
+		if lt != nil && lt.Timestamp != nil {
+			unit = lt.Timestamp.Unit
+		}
+
+		t := v.Interface().(time.Time)
+		var val int64
+		switch {
+		case unit.Millis != nil:
+			val = t.UnixMilli()
+		case unit.Micros != nil:
+			val = t.UnixMicro()
+		default:
+			val = t.UnixNano()
+		}
+		return makeValueInt64(val)
+	}
+
 	switch k {
 	case Boolean:
 		return makeValueBoolean(v.Bool())
@@ -211,7 +290,7 @@ func makeValue(k Kind, v reflect.Value) Value {
 		case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int:
 			return makeValueInt64(v.Int())
 		case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
-			return makeValueInt64(int64(v.Uint()))
+			return makeValueUint64(v.Uint())
 		}
 
 	case Int96:
@@ -250,10 +329,18 @@ func makeValue(k Kind, v reflect.Value) Value {
 			if v.Type().Elem().Kind() == reflect.Uint8 {
 				return makeValueFixedLenByteArray(v)
 			}
+		case reflect.Slice:
+			if v.Type().Elem().Kind() == reflect.Uint8 {
+				return makeValueBytes(k, v.Bytes())
+			}
 		}
 	}
 
 	panic("cannot create parquet value of type " + k.String() + " from go value of type " + v.Type().String())
+}
+
+func makeValueKind(kind Kind) Value {
+	return Value{kind: ^int8(kind)}
 }
 
 func makeValueBoolean(value bool) Value {
@@ -294,6 +381,20 @@ func makeValueInt96(value deprecated.Int96) Value {
 	}
 }
 
+func makeValueUint32(value uint32) Value {
+	return Value{
+		kind: ^int8(Int32),
+		u64:  uint64(value),
+	}
+}
+
+func makeValueUint64(value uint64) Value {
+	return Value{
+		kind: ^int8(Int64),
+		u64:  value,
+	}
+}
+
 func makeValueFloat(value float32) Value {
 	return Value{
 		kind: ^int8(Float),
@@ -309,11 +410,11 @@ func makeValueDouble(value float64) Value {
 }
 
 func makeValueBytes(kind Kind, value []byte) Value {
-	return makeValueByteArray(kind, *(**byte)(unsafe.Pointer(&value)), len(value))
+	return makeValueByteArray(kind, unsafecast.AddressOfBytes(value), len(value))
 }
 
 func makeValueString(kind Kind, value string) Value {
-	return makeValueByteArray(kind, *(**byte)(unsafe.Pointer(&value)), len(value))
+	return makeValueByteArray(kind, unsafecast.AddressOfString(value), len(value))
 }
 
 func makeValueFixedLenByteArray(v reflect.Value) Value {
@@ -328,9 +429,7 @@ func makeValueFixedLenByteArray(v reflect.Value) Value {
 		u.Elem().Set(v)
 		v = u
 	}
-	// TODO: unclear if the conversion to unsafe.Pointer from
-	// reflect.Value.Pointer is safe here.
-	return makeValueByteArray(FixedLenByteArray, (*byte)(unsafe.Pointer(v.Pointer())), t.Len())
+	return makeValueByteArray(FixedLenByteArray, (*byte)(unsafePointer(v)), t.Len())
 }
 
 func makeValueByteArray(kind Kind, data *byte, size int) Value {
@@ -341,36 +440,130 @@ func makeValueByteArray(kind Kind, data *byte, size int) Value {
 	}
 }
 
+// These methods are internal versions of methods exported by the Value type,
+// they are usually inlined by the compiler and intended to be used inside the
+// parquet-go package because they tend to generate better code than their
+// exported counter part, which requires making a copy of the receiver.
+func (v *Value) isNull() bool            { return v.kind == 0 }
+func (v *Value) byte() byte              { return byte(v.u64) }
+func (v *Value) boolean() bool           { return v.u64 != 0 }
+func (v *Value) int32() int32            { return int32(v.u64) }
+func (v *Value) int64() int64            { return int64(v.u64) }
+func (v *Value) int96() deprecated.Int96 { return makeInt96(v.byteArray()) }
+func (v *Value) float() float32          { return math.Float32frombits(uint32(v.u64)) }
+func (v *Value) double() float64         { return math.Float64frombits(uint64(v.u64)) }
+func (v *Value) uint32() uint32          { return uint32(v.u64) }
+func (v *Value) uint64() uint64          { return v.u64 }
+func (v *Value) byteArray() []byte       { return unsafecast.Bytes(v.ptr, int(v.u64)) }
+func (v *Value) string() string          { return unsafecast.BytesToString(v.byteArray()) }
+func (v *Value) be128() *[16]byte        { return (*[16]byte)(unsafe.Pointer(v.ptr)) }
+func (v *Value) column() int             { return int(^v.columnIndex) }
+
+func (v Value) convertToBoolean(x bool) Value {
+	v.kind = ^int8(Boolean)
+	v.ptr = nil
+	v.u64 = 0
+	if x {
+		v.u64 = 1
+	}
+	return v
+}
+
+func (v Value) convertToInt32(x int32) Value {
+	v.kind = ^int8(Int32)
+	v.ptr = nil
+	v.u64 = uint64(x)
+	return v
+}
+
+func (v Value) convertToInt64(x int64) Value {
+	v.kind = ^int8(Int64)
+	v.ptr = nil
+	v.u64 = uint64(x)
+	return v
+}
+
+func (v Value) convertToInt96(x deprecated.Int96) Value {
+	i96 := makeValueInt96(x)
+	v.kind = i96.kind
+	v.ptr = i96.ptr
+	v.u64 = i96.u64
+	return v
+}
+
+func (v Value) convertToFloat(x float32) Value {
+	v.kind = ^int8(Float)
+	v.ptr = nil
+	v.u64 = uint64(math.Float32bits(x))
+	return v
+}
+
+func (v Value) convertToDouble(x float64) Value {
+	v.kind = ^int8(Double)
+	v.ptr = nil
+	v.u64 = math.Float64bits(x)
+	return v
+}
+
+func (v Value) convertToByteArray(x []byte) Value {
+	v.kind = ^int8(ByteArray)
+	v.ptr = unsafecast.AddressOfBytes(x)
+	v.u64 = uint64(len(x))
+	return v
+}
+
+func (v Value) convertToFixedLenByteArray(x []byte) Value {
+	v.kind = ^int8(FixedLenByteArray)
+	v.ptr = unsafecast.AddressOfBytes(x)
+	v.u64 = uint64(len(x))
+	return v
+}
+
 // Kind returns the kind of v, which represents its parquet physical type.
 func (v Value) Kind() Kind { return ^Kind(v.kind) }
 
 // IsNull returns true if v is the null value.
-func (v Value) IsNull() bool { return v.kind == 0 }
+func (v Value) IsNull() bool { return v.isNull() }
+
+// Byte returns v as a byte, which may truncate the underlying byte.
+func (v Value) Byte() byte { return v.byte() }
 
 // Boolean returns v as a bool, assuming the underlying type is BOOLEAN.
-func (v Value) Boolean() bool { return v.u64 != 0 }
+func (v Value) Boolean() bool { return v.boolean() }
 
 // Int32 returns v as a int32, assuming the underlying type is INT32.
-func (v Value) Int32() int32 { return int32(v.u64) }
+func (v Value) Int32() int32 { return v.int32() }
 
 // Int64 returns v as a int64, assuming the underlying type is INT64.
-func (v Value) Int64() int64 { return int64(v.u64) }
+func (v Value) Int64() int64 { return v.int64() }
 
 // Int96 returns v as a int96, assuming the underlying type is INT96.
-func (v Value) Int96() deprecated.Int96 { return makeInt96(v.ByteArray()) }
+func (v Value) Int96() deprecated.Int96 {
+	var val deprecated.Int96
+	if !v.isNull() {
+		val = v.int96()
+	}
+	return val
+}
 
 // Float returns v as a float32, assuming the underlying type is FLOAT.
-func (v Value) Float() float32 { return math.Float32frombits(uint32(v.u64)) }
+func (v Value) Float() float32 { return v.float() }
 
 // Double returns v as a float64, assuming the underlying type is DOUBLE.
-func (v Value) Double() float64 { return math.Float64frombits(v.u64) }
+func (v Value) Double() float64 { return v.double() }
+
+// Uint32 returns v as a uint32, assuming the underlying type is INT32.
+func (v Value) Uint32() uint32 { return v.uint32() }
+
+// Uint64 returns v as a uint64, assuming the underlying type is INT64.
+func (v Value) Uint64() uint64 { return v.uint64() }
 
 // ByteArray returns v as a []byte, assuming the underlying type is either
 // BYTE_ARRAY or FIXED_LEN_BYTE_ARRAY.
 //
 // The application must treat the returned byte slice as a read-only value,
 // mutating the content will result in undefined behaviors.
-func (v Value) ByteArray() []byte { return unsafe.Slice(v.ptr, int(v.u64)) }
+func (v Value) ByteArray() []byte { return v.byteArray() }
 
 // RepetitionLevel returns the repetition level of v.
 func (v Value) RepetitionLevel() int { return int(v.repetitionLevel) }
@@ -381,12 +574,31 @@ func (v Value) DefinitionLevel() int { return int(v.definitionLevel) }
 // Column returns the column index within the row that v was created from.
 //
 // Returns -1 if the value does not carry a column index.
-func (v Value) Column() int { return int(^v.columnIndex) }
+func (v Value) Column() int { return v.column() }
 
 // Bytes returns the binary representation of v.
 //
 // If v is the null value, an nil byte slice is returned.
-func (v Value) Bytes() []byte { return v.AppendBytes(nil) }
+func (v Value) Bytes() []byte {
+	switch v.Kind() {
+	case Boolean:
+		buf := [8]byte{}
+		binary.LittleEndian.PutUint32(buf[:4], v.uint32())
+		return buf[0:1]
+	case Int32, Float:
+		buf := [8]byte{}
+		binary.LittleEndian.PutUint32(buf[:4], v.uint32())
+		return buf[:4]
+	case Int64, Double:
+		buf := [8]byte{}
+		binary.LittleEndian.PutUint64(buf[:8], v.uint64())
+		return buf[:8]
+	case ByteArray, FixedLenByteArray, Int96:
+		return v.byteArray()
+	default:
+		return nil
+	}
+}
 
 // AppendBytes appends the binary representation of v to b.
 //
@@ -395,16 +607,16 @@ func (v Value) AppendBytes(b []byte) []byte {
 	buf := [8]byte{}
 	switch v.Kind() {
 	case Boolean:
-		binary.LittleEndian.PutUint32(buf[:4], uint32(v.u64))
+		binary.LittleEndian.PutUint32(buf[:4], v.uint32())
 		return append(b, buf[0])
 	case Int32, Float:
-		binary.LittleEndian.PutUint32(buf[:4], uint32(v.u64))
+		binary.LittleEndian.PutUint32(buf[:4], v.uint32())
 		return append(b, buf[:4]...)
 	case Int64, Double:
-		binary.LittleEndian.PutUint64(buf[:8], v.u64)
+		binary.LittleEndian.PutUint64(buf[:8], v.uint64())
 		return append(b, buf[:8]...)
 	case ByteArray, FixedLenByteArray, Int96:
-		return append(b, v.ByteArray()...)
+		return append(b, v.byteArray()...)
 	default:
 		return b
 	}
@@ -415,19 +627,19 @@ func (v Value) AppendBytes(b []byte) []byte {
 //
 // The following formatting options are supported:
 //
-//		%c	prints the column index
-//		%+c	prints the column index, prefixed with "C:"
-//		%d	prints the definition level
-//		%+d	prints the definition level, prefixed with "D:"
-//		%r	prints the repetition level
-//		%+r	prints the repetition level, prefixed with "R:"
-//		%q	prints the quoted representation of v
-//		%+q	prints the quoted representation of v, prefixed with "V:"
-//		%s	prints the string representation of v
-//		%+s	prints the string representation of v, prefixed with "V:"
-//		%v	same as %s
-//		%+v	prints a verbose representation of v
-//		%#v	prints a Go value representation of v
+//	%c	prints the column index
+//	%+c	prints the column index, prefixed with "C:"
+//	%d	prints the definition level
+//	%+d	prints the definition level, prefixed with "D:"
+//	%r	prints the repetition level
+//	%+r	prints the repetition level, prefixed with "R:"
+//	%q	prints the quoted representation of v
+//	%+q	prints the quoted representation of v, prefixed with "V:"
+//	%s	prints the string representation of v
+//	%+s	prints the string representation of v, prefixed with "V:"
+//	%v	same as %s
+//	%+v	prints a verbose representation of v
+//	%#v	prints a Go value representation of v
 //
 // Format satisfies the fmt.Formatter interface.
 func (v Value) Format(w fmt.State, r rune) {
@@ -436,19 +648,19 @@ func (v Value) Format(w fmt.State, r rune) {
 		if w.Flag('+') {
 			io.WriteString(w, "C:")
 		}
-		fmt.Fprint(w, v.Column())
+		fmt.Fprint(w, v.column())
 
 	case 'd':
 		if w.Flag('+') {
 			io.WriteString(w, "D:")
 		}
-		fmt.Fprint(w, v.DefinitionLevel())
+		fmt.Fprint(w, v.definitionLevel)
 
 	case 'r':
 		if w.Flag('+') {
 			io.WriteString(w, "R:")
 		}
-		fmt.Fprint(w, v.RepetitionLevel())
+		fmt.Fprint(w, v.repetitionLevel)
 
 	case 'q':
 		if w.Flag('+') {
@@ -456,7 +668,7 @@ func (v Value) Format(w fmt.State, r rune) {
 		}
 		switch v.Kind() {
 		case ByteArray, FixedLenByteArray:
-			fmt.Fprintf(w, "%q", v.ByteArray())
+			fmt.Fprintf(w, "%q", v.byteArray())
 		default:
 			fmt.Fprintf(w, `"%s"`, v)
 		}
@@ -467,19 +679,19 @@ func (v Value) Format(w fmt.State, r rune) {
 		}
 		switch v.Kind() {
 		case Boolean:
-			fmt.Fprint(w, v.Boolean())
+			fmt.Fprint(w, v.boolean())
 		case Int32:
-			fmt.Fprint(w, v.Int32())
+			fmt.Fprint(w, v.int32())
 		case Int64:
-			fmt.Fprint(w, v.Int64())
+			fmt.Fprint(w, v.int64())
 		case Int96:
-			fmt.Fprint(w, v.Int96())
+			fmt.Fprint(w, v.int96())
 		case Float:
-			fmt.Fprint(w, v.Float())
+			fmt.Fprint(w, v.float())
 		case Double:
-			fmt.Fprint(w, v.Double())
+			fmt.Fprint(w, v.double())
 		case ByteArray, FixedLenByteArray:
-			w.Write(v.ByteArray())
+			w.Write(v.byteArray())
 		default:
 			io.WriteString(w, "<null>")
 		}
@@ -489,44 +701,67 @@ func (v Value) Format(w fmt.State, r rune) {
 		case w.Flag('+'):
 			fmt.Fprintf(w, "%+[1]c %+[1]d %+[1]r %+[1]s", v)
 		case w.Flag('#'):
-			fmt.Fprintf(w, "parquet.Value{%+[1]c,%+[1]d,%+[1]r,%+[1]s}", v)
+			v.formatGoString(w)
 		default:
 			v.Format(w, 's')
 		}
 	}
 }
 
+func (v Value) formatGoString(w fmt.State) {
+	io.WriteString(w, "parquet.")
+	switch v.Kind() {
+	case Boolean:
+		fmt.Fprintf(w, "BooleanValue(%t)", v.boolean())
+	case Int32:
+		fmt.Fprintf(w, "Int32Value(%d)", v.int32())
+	case Int64:
+		fmt.Fprintf(w, "Int64Value(%d)", v.int64())
+	case Int96:
+		fmt.Fprintf(w, "Int96Value(%#v)", v.int96())
+	case Float:
+		fmt.Fprintf(w, "FloatValue(%g)", v.float())
+	case Double:
+		fmt.Fprintf(w, "DoubleValue(%g)", v.double())
+	case ByteArray:
+		fmt.Fprintf(w, "ByteArrayValue(%q)", v.byteArray())
+	case FixedLenByteArray:
+		fmt.Fprintf(w, "FixedLenByteArrayValue(%#v)", v.byteArray())
+	default:
+		io.WriteString(w, "Value{}")
+		return
+	}
+	fmt.Fprintf(w, ".Level(%d,%d,%d)",
+		v.RepetitionLevel(),
+		v.DefinitionLevel(),
+		v.Column(),
+	)
+}
+
 // String returns a string representation of v.
 func (v Value) String() string {
 	switch v.Kind() {
 	case Boolean:
-		return strconv.FormatBool(v.Boolean())
+		return strconv.FormatBool(v.boolean())
 	case Int32:
-		return strconv.FormatInt(int64(v.Int32()), 10)
+		return strconv.FormatInt(int64(v.int32()), 10)
 	case Int64:
-		return strconv.FormatInt(v.Int64(), 10)
+		return strconv.FormatInt(v.int64(), 10)
 	case Int96:
 		return v.Int96().String()
 	case Float:
-		return strconv.FormatFloat(float64(v.Float()), 'g', -1, 32)
+		return strconv.FormatFloat(float64(v.float()), 'g', -1, 32)
 	case Double:
-		return strconv.FormatFloat(v.Double(), 'g', -1, 32)
+		return strconv.FormatFloat(v.double(), 'g', -1, 32)
 	case ByteArray, FixedLenByteArray:
-		// As an optimizations for the common case of using String on UTF8
-		// columns we convert the byte array to a string without copying the
-		// underlying data to a new memory location. This is safe as long as the
-		// application respects the requirement to not mutate the byte slices
-		// returned when calling ByteArray.
-		return unsafeBytesToString(v.ByteArray())
+		return string(v.byteArray())
 	default:
 		return "<null>"
 	}
 }
 
 // GoString returns a Go value string representation of v.
-func (v Value) GoString() string {
-	return fmt.Sprintf("%#v", v)
-}
+func (v Value) GoString() string { return fmt.Sprintf("%#v", v) }
 
 // Level returns v with the repetition level, definition level, and column index
 // set to the values passed as arguments.
@@ -543,8 +778,7 @@ func (v Value) Level(repetitionLevel, definitionLevel, columnIndex int) Value {
 func (v Value) Clone() Value {
 	switch k := v.Kind(); k {
 	case ByteArray, FixedLenByteArray:
-		b := copyBytes(v.ByteArray())
-		v.ptr = *(**byte)(unsafe.Pointer(&b))
+		v.ptr = unsafecast.AddressOfBytes(copyBytes(v.byteArray()))
 	}
 	return v
 }
@@ -555,123 +789,6 @@ func makeInt96(bits []byte) (i96 deprecated.Int96) {
 		1: binary.LittleEndian.Uint32(bits[4:8]),
 		0: binary.LittleEndian.Uint32(bits[0:4]),
 	}
-}
-
-func assignValue(dst reflect.Value, src Value) error {
-	if src.IsNull() {
-		dst.Set(reflect.Zero(dst.Type()))
-		return nil
-	}
-
-	dstKind := dst.Kind()
-	srcKind := src.Kind()
-
-	var val reflect.Value
-	switch srcKind {
-	case Boolean:
-		v := src.Boolean()
-		switch dstKind {
-		case reflect.Bool:
-			dst.SetBool(v)
-			return nil
-		default:
-			val = reflect.ValueOf(v)
-		}
-
-	case Int32:
-		v := int64(src.Int32())
-		switch dstKind {
-		case reflect.Int8, reflect.Int16, reflect.Int32:
-			dst.SetInt(int64(v))
-			return nil
-		case reflect.Uint8, reflect.Uint16, reflect.Uint32:
-			dst.SetUint(uint64(v))
-			return nil
-		default:
-			val = reflect.ValueOf(v)
-		}
-
-	case Int64:
-		v := src.Int64()
-		switch dstKind {
-		case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int:
-			dst.SetInt(v)
-			return nil
-		case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
-			dst.SetUint(uint64(v))
-			return nil
-		default:
-			val = reflect.ValueOf(v)
-		}
-
-	case Int96:
-		val = reflect.ValueOf(src.Int96())
-
-	case Float:
-		v := src.Float()
-		switch dstKind {
-		case reflect.Float32, reflect.Float64:
-			dst.SetFloat(float64(v))
-			return nil
-		default:
-			val = reflect.ValueOf(v)
-		}
-
-	case Double:
-		v := src.Double()
-		switch dstKind {
-		case reflect.Float32, reflect.Float64:
-			dst.SetFloat(v)
-			return nil
-		default:
-			val = reflect.ValueOf(v)
-		}
-
-	case ByteArray:
-		v := src.ByteArray()
-		switch dstKind {
-		case reflect.String:
-			dst.SetString(string(v))
-			return nil
-		case reflect.Slice:
-			if dst.Type().Elem().Kind() == reflect.Uint8 {
-				dst.SetBytes(copyBytes(v))
-				return nil
-			}
-		default:
-			val = reflect.ValueOf(v)
-		}
-
-	case FixedLenByteArray:
-		v := src.ByteArray()
-		switch dstKind {
-		case reflect.Array:
-			if dst.Type().Elem().Kind() == reflect.Uint8 && dst.Len() == len(v) {
-				// This code could be implemented as a call to reflect.Copy but
-				// it would require creating a reflect.Value from v which causes
-				// the heap allocation to pack the []byte value. To avoid this
-				// overhead we instead convert the reflect.Value holding the
-				// destination array into a byte slice which allows us to use
-				// a more efficient call to copy.
-				copy(unsafeByteArray(dst, len(v)), v)
-				return nil
-			}
-		case reflect.Slice:
-			if dst.Type().Elem().Kind() == reflect.Uint8 {
-				dst.SetBytes(copyBytes(v))
-				return nil
-			}
-		default:
-			val = reflect.ValueOf(v)
-		}
-	}
-
-	if val.IsValid() && val.Type().AssignableTo(dst.Type()) {
-		dst.Set(val)
-		return nil
-	}
-
-	return fmt.Errorf("cannot assign parquet value of type %s to go value of type %s", srcKind.String(), dst.Type())
 }
 
 func parseValue(kind Kind, data []byte) (val Value, err error) {
@@ -703,7 +820,7 @@ func parseValue(kind Kind, data []byte) (val Value, err error) {
 	case ByteArray, FixedLenByteArray:
 		val = makeValueBytes(kind, data)
 	}
-	if val.IsNull() {
+	if val.isNull() {
 		err = fmt.Errorf("cannot decode %s value from input of length %d", kind, len(data))
 	}
 	return val, err
@@ -715,18 +832,6 @@ func copyBytes(b []byte) []byte {
 	return c
 }
 
-func unsafeBytesToString(b []byte) string {
-	return *(*string)(unsafe.Pointer(&b))
-}
-
-func unsafePointerOf(v reflect.Value) unsafe.Pointer {
-	return (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1]
-}
-
-func unsafeByteArray(v reflect.Value, n int) []byte {
-	return unsafe.Slice((*byte)(unsafePointerOf(v)), n)
-}
-
 // Equal returns true if v1 and v2 are equal.
 //
 // Values are considered equal if they are of the same physical type and hold
@@ -734,31 +839,42 @@ func unsafeByteArray(v reflect.Value, n int) []byte {
 // the underlying byte arrays are tested for equality.
 //
 // Note that the repetition levels, definition levels, and column indexes are
-// not compared by this function.
+// not compared by this function, use DeepEqual instead.
 func Equal(v1, v2 Value) bool {
 	if v1.kind != v2.kind {
 		return false
 	}
-	switch v1.Kind() {
+	switch ^Kind(v1.kind) {
 	case Boolean:
-		return v1.Boolean() == v2.Boolean()
+		return v1.boolean() == v2.boolean()
 	case Int32:
-		return v1.Int32() == v2.Int32()
+		return v1.int32() == v2.int32()
 	case Int64:
-		return v1.Int64() == v2.Int64()
+		return v1.int64() == v2.int64()
 	case Int96:
-		return v1.Int96() == v2.Int96()
+		return v1.int96() == v2.int96()
 	case Float:
-		return v1.Float() == v2.Float()
+		return v1.float() == v2.float()
 	case Double:
-		return v1.Double() == v2.Double()
+		return v1.double() == v2.double()
 	case ByteArray, FixedLenByteArray:
-		return bytes.Equal(v1.ByteArray(), v2.ByteArray())
+		return bytes.Equal(v1.byteArray(), v2.byteArray())
 	case -1: // null
 		return true
 	default:
 		return false
 	}
+}
+
+// DeepEqual returns true if v1 and v2 are equal, including their repetition
+// levels, definition levels, and column indexes.
+//
+// See Equal for details about how value equality is determined.
+func DeepEqual(v1, v2 Value) bool {
+	return Equal(v1, v2) &&
+		v1.repetitionLevel == v2.repetitionLevel &&
+		v1.definitionLevel == v2.definitionLevel &&
+		v1.columnIndex == v2.columnIndex
 }
 
 var (
@@ -772,6 +888,172 @@ func clearValues(values []Value) {
 	}
 }
 
-type errorValueReader struct{ err error }
+// BooleanReader is an interface implemented by ValueReader instances which
+// expose the content of a column of boolean values.
+type BooleanReader interface {
+	// Read boolean values into the buffer passed as argument.
+	//
+	// The method returns io.EOF when all values have been read.
+	ReadBooleans(values []bool) (int, error)
+}
 
-func (r *errorValueReader) ReadValues([]Value) (int, error) { return 0, r.err }
+// BooleanWriter is an interface implemented by ValueWriter instances which
+// support writing columns of boolean values.
+type BooleanWriter interface {
+	// Write boolean values.
+	//
+	// The method returns the number of values written, and any error that
+	// occurred while writing the values.
+	WriteBooleans(values []bool) (int, error)
+}
+
+// Int32Reader is an interface implemented by ValueReader instances which expose
+// the content of a column of int32 values.
+type Int32Reader interface {
+	// Read 32 bits integer values into the buffer passed as argument.
+	//
+	// The method returns io.EOF when all values have been read.
+	ReadInt32s(values []int32) (int, error)
+}
+
+// Int32Writer is an interface implemented by ValueWriter instances which
+// support writing columns of 32 bits signed integer values.
+type Int32Writer interface {
+	// Write 32 bits signed integer values.
+	//
+	// The method returns the number of values written, and any error that
+	// occurred while writing the values.
+	WriteInt32s(values []int32) (int, error)
+}
+
+// Int64Reader is an interface implemented by ValueReader instances which expose
+// the content of a column of int64 values.
+type Int64Reader interface {
+	// Read 64 bits integer values into the buffer passed as argument.
+	//
+	// The method returns io.EOF when all values have been read.
+	ReadInt64s(values []int64) (int, error)
+}
+
+// Int64Writer is an interface implemented by ValueWriter instances which
+// support writing columns of 64 bits signed integer values.
+type Int64Writer interface {
+	// Write 64 bits signed integer values.
+	//
+	// The method returns the number of values written, and any error that
+	// occurred while writing the values.
+	WriteInt64s(values []int64) (int, error)
+}
+
+// Int96Reader is an interface implemented by ValueReader instances which expose
+// the content of a column of int96 values.
+type Int96Reader interface {
+	// Read 96 bits integer values into the buffer passed as argument.
+	//
+	// The method returns io.EOF when all values have been read.
+	ReadInt96s(values []deprecated.Int96) (int, error)
+}
+
+// Int96Writer is an interface implemented by ValueWriter instances which
+// support writing columns of 96 bits signed integer values.
+type Int96Writer interface {
+	// Write 96 bits signed integer values.
+	//
+	// The method returns the number of values written, and any error that
+	// occurred while writing the values.
+	WriteInt96s(values []deprecated.Int96) (int, error)
+}
+
+// FloatReader is an interface implemented by ValueReader instances which expose
+// the content of a column of single-precision floating point values.
+type FloatReader interface {
+	// Read single-precision floating point values into the buffer passed as
+	// argument.
+	//
+	// The method returns io.EOF when all values have been read.
+	ReadFloats(values []float32) (int, error)
+}
+
+// FloatWriter is an interface implemented by ValueWriter instances which
+// support writing columns of single-precision floating point values.
+type FloatWriter interface {
+	// Write single-precision floating point values.
+	//
+	// The method returns the number of values written, and any error that
+	// occurred while writing the values.
+	WriteFloats(values []float32) (int, error)
+}
+
+// DoubleReader is an interface implemented by ValueReader instances which
+// expose the content of a column of double-precision float point values.
+type DoubleReader interface {
+	// Read double-precision floating point values into the buffer passed as
+	// argument.
+	//
+	// The method returns io.EOF when all values have been read.
+	ReadDoubles(values []float64) (int, error)
+}
+
+// DoubleWriter is an interface implemented by ValueWriter instances which
+// support writing columns of double-precision floating point values.
+type DoubleWriter interface {
+	// Write double-precision floating point values.
+	//
+	// The method returns the number of values written, and any error that
+	// occurred while writing the values.
+	WriteDoubles(values []float64) (int, error)
+}
+
+// ByteArrayReader is an interface implemented by ValueReader instances which
+// expose the content of a column of variable length byte array values.
+type ByteArrayReader interface {
+	// Read values into the byte buffer passed as argument, returning the number
+	// of values written to the buffer (not the number of bytes). Values are
+	// written using the PLAIN encoding, each byte array prefixed with its
+	// length encoded as a 4 bytes little endian unsigned integer.
+	//
+	// The method returns io.EOF when all values have been read.
+	//
+	// If the buffer was not empty, but too small to hold at least one value,
+	// io.ErrShortBuffer is returned.
+	ReadByteArrays(values []byte) (int, error)
+}
+
+// ByteArrayWriter is an interface implemented by ValueWriter instances which
+// support writing columns of variable length byte array values.
+type ByteArrayWriter interface {
+	// Write variable length byte array values.
+	//
+	// The values passed as input must be laid out using the PLAIN encoding,
+	// with each byte array prefixed with the four bytes little endian unsigned
+	// integer length.
+	//
+	// The method returns the number of values written to the underlying column
+	// (not the number of bytes), or any error that occurred while attempting to
+	// write the values.
+	WriteByteArrays(values []byte) (int, error)
+}
+
+// FixedLenByteArrayReader is an interface implemented by ValueReader instances
+// which expose the content of a column of fixed length byte array values.
+type FixedLenByteArrayReader interface {
+	// Read values into the byte buffer passed as argument, returning the number
+	// of values written to the buffer (not the number of bytes).
+	//
+	// The method returns io.EOF when all values have been read.
+	//
+	// If the buffer was not empty, but too small to hold at least one value,
+	// io.ErrShortBuffer is returned.
+	ReadFixedLenByteArrays(values []byte) (int, error)
+}
+
+// FixedLenByteArrayWriter is an interface implemented by ValueWriter instances
+// which support writing columns of fixed length byte array values.
+type FixedLenByteArrayWriter interface {
+	// Writes the fixed length byte array values.
+	//
+	// The size of the values is assumed to be the same as the expected size of
+	// items in the column. The method errors if the length of the input values
+	// is not a multiple of the expected item size.
+	WriteFixedLenByteArrays(values []byte) (int, error)
+}

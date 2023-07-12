@@ -7,7 +7,7 @@ import (
 	"github.com/segmentio/parquet-go"
 )
 
-func TestPrint(t *testing.T) {
+func TestPrintSchema(t *testing.T) {
 	tests := []struct {
 		node  parquet.Node
 		print string
@@ -141,14 +141,14 @@ func TestPrint(t *testing.T) {
 		{
 			node: parquet.Group{"cost": parquet.Decimal(0, 9, parquet.Int32Type)},
 			print: `message Test {
-	required int32 cost (DECIMAL(0,9));
+	required int32 cost (DECIMAL(9,0));
 }`,
 		},
 
 		{
 			node: parquet.Group{"cost": parquet.Decimal(0, 18, parquet.Int64Type)},
 			print: `message Test {
-	required int64 cost (DECIMAL(0,18));
+	required int64 cost (DECIMAL(18,0));
 }`,
 		},
 
@@ -255,7 +255,7 @@ func TestPrint(t *testing.T) {
 		t.Run("", func(t *testing.T) {
 			buf := new(strings.Builder)
 
-			if err := parquet.Print(buf, "Test", test.node); err != nil {
+			if err := parquet.PrintSchema(buf, "Test", test.node); err != nil {
 				t.Fatal(err)
 			}
 

@@ -1,7 +1,13 @@
 package parquet
 
 import (
+	"log"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
+
+	"github.com/segmentio/parquet-go/internal/debug"
 )
 
 // Buffer represents an in-memory group of parquet rows.
@@ -12,8 +18,9 @@ import (
 type Buffer struct {
 	config  *RowGroupConfig
 	schema  *Schema
-	rowbuf  []Value
+	rowbuf  []Row
 	colbuf  [][]Value
+	chunks  []ColumnChunk
 	columns []ColumnBuffer
 	sorted  []ColumnBuffer
 }
@@ -35,7 +42,6 @@ type Buffer struct {
 //		buffer := parquet.NewBuffer(config)
 //		...
 //	}
-//
 func NewBuffer(options ...RowGroupOption) *Buffer {
 	config, err := NewRowGroupConfig(options...)
 	if err != nil {
@@ -54,23 +60,33 @@ func (buf *Buffer) configure(schema *Schema) {
 	if schema == nil {
 		return
 	}
-	sortingColumns := buf.config.SortingColumns
+	sortingColumns := buf.config.Sorting.SortingColumns
 	buf.sorted = make([]ColumnBuffer, len(sortingColumns))
 
 	forEachLeafColumnOf(schema, func(leaf leafColumn) {
 		nullOrdering := nullsGoLast
+		columnIndex := int(leaf.columnIndex)
 		columnType := leaf.node.Type()
-		bufferSize := buf.config.ColumnBufferSize
+		bufferCap := buf.config.ColumnBufferCapacity
 		dictionary := (Dictionary)(nil)
-		encoding, _ := encodingAndCompressionOf(leaf.node)
+		encoding := encodingOf(leaf.node)
 
 		if isDictionaryEncoding(encoding) {
-			bufferSize /= 2
-			dictionary = columnType.NewDictionary(bufferSize)
+			estimatedDictBufferSize := columnType.EstimateSize(bufferCap)
+			dictBuffer := columnType.NewValues(
+				make([]byte, 0, estimatedDictBufferSize),
+				nil,
+			)
+			dictionary = columnType.NewDictionary(columnIndex, 0, dictBuffer)
 			columnType = dictionary.Type()
 		}
 
-		column := columnType.NewColumnBuffer(int(leaf.columnIndex), bufferSize)
+		sortingIndex := searchSortingColumn(sortingColumns, leaf.path)
+		if sortingIndex < len(sortingColumns) && sortingColumns[sortingIndex].NullsFirst() {
+			nullOrdering = nullsGoFirst
+		}
+
+		column := columnType.NewColumnBuffer(columnIndex, bufferCap)
 		switch {
 		case leaf.maxRepetitionLevel > 0:
 			column = newRepeatedColumnBuffer(column, leaf.maxRepetitionLevel, leaf.maxDefinitionLevel, nullOrdering)
@@ -79,20 +95,22 @@ func (buf *Buffer) configure(schema *Schema) {
 		}
 		buf.columns = append(buf.columns, column)
 
-		if sortingIndex := searchSortingColumn(sortingColumns, leaf.path); sortingIndex < len(sortingColumns) {
+		if sortingIndex < len(sortingColumns) {
 			if sortingColumns[sortingIndex].Descending() {
 				column = &reversedColumnBuffer{column}
-			}
-			if sortingColumns[sortingIndex].NullsFirst() {
-				nullOrdering = nullsGoFirst
 			}
 			buf.sorted[sortingIndex] = column
 		}
 	})
 
 	buf.schema = schema
-	buf.rowbuf = make([]Value, 0, 10)
+	buf.rowbuf = make([]Row, 0, 1)
 	buf.colbuf = make([][]Value, len(buf.columns))
+	buf.chunks = make([]ColumnChunk, len(buf.columns))
+
+	for i, column := range buf.columns {
+		buf.chunks[i] = column
+	}
 }
 
 // Size returns the estimated size of the buffer in memory (in bytes).
@@ -107,15 +125,19 @@ func (buf *Buffer) Size() int64 {
 // NumRows returns the number of rows written to the buffer.
 func (buf *Buffer) NumRows() int64 { return int64(buf.Len()) }
 
-// NumColumns returns the number of columns in the buffer.
-//
-// The count will be zero until a schema is configured on buf.
-func (buf *Buffer) NumColumns() int { return len(buf.columns) }
+// ColumnChunks returns the buffer columns.
+func (buf *Buffer) ColumnChunks() []ColumnChunk { return buf.chunks }
 
-// Column returns the buffer column at index i.
+// ColumnBuffer returns the buffer columns.
 //
-// The method panics if i is negative or beyond the last column index in buf.
-func (buf *Buffer) Column(i int) ColumnChunk { return buf.columns[i] }
+// This method is similar to ColumnChunks, but returns a list of ColumnBuffer
+// instead of a ColumnChunk values (the latter being read-only); calling
+// ColumnBuffers or ColumnChunks with the same index returns the same underlying
+// objects, but with different types, which removes the need for making a type
+// assertion if the program needed to write directly to the column buffers.
+// The presence of the ColumnChunks method is still required to satisfy the
+// RowGroup interface.
+func (buf *Buffer) ColumnBuffers() []ColumnBuffer { return buf.columns }
 
 // Schema returns the schema of the buffer.
 //
@@ -128,7 +150,7 @@ func (buf *Buffer) Schema() *Schema { return buf.schema }
 //
 // The sorting order is configured by passing a SortingColumns option when
 // constructing the buffer.
-func (buf *Buffer) SortingColumns() []SortingColumn { return buf.config.SortingColumns }
+func (buf *Buffer) SortingColumns() []SortingColumn { return buf.config.Sorting.SortingColumns }
 
 // Len returns the number of rows written to the buffer.
 func (buf *Buffer) Len() int {
@@ -172,15 +194,17 @@ func (buf *Buffer) Write(row interface{}) error {
 	if buf.schema == nil {
 		buf.configure(SchemaOf(row))
 	}
-	defer func() {
-		clearValues(buf.rowbuf)
-	}()
-	buf.rowbuf = buf.schema.Deconstruct(buf.rowbuf[:0], row)
-	return buf.WriteRow(buf.rowbuf)
+
+	buf.rowbuf = buf.rowbuf[:1]
+	defer clearRows(buf.rowbuf)
+
+	buf.rowbuf[0] = buf.schema.Deconstruct(buf.rowbuf[0], row)
+	_, err := buf.WriteRows(buf.rowbuf)
+	return err
 }
 
-// WriteRow writes a parquet row to the buffer.
-func (buf *Buffer) WriteRow(row Row) error {
+// WriteRows writes parquet rows to the buffer.
+func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	defer func() {
 		for i, colbuf := range buf.colbuf {
 			clearValues(colbuf)
@@ -189,21 +213,27 @@ func (buf *Buffer) WriteRow(row Row) error {
 	}()
 
 	if buf.schema == nil {
-		return ErrRowGroupSchemaMissing
+		return 0, ErrRowGroupSchemaMissing
 	}
 
-	for _, value := range row {
-		columnIndex := value.Column()
-		buf.colbuf[columnIndex] = append(buf.colbuf[columnIndex], value)
-	}
-
-	for columnIndex, values := range buf.colbuf {
-		if err := buf.columns[columnIndex].WriteRow(values); err != nil {
-			return err
+	for _, row := range rows {
+		for _, value := range row {
+			columnIndex := value.Column()
+			buf.colbuf[columnIndex] = append(buf.colbuf[columnIndex], value)
 		}
 	}
 
-	return nil
+	for columnIndex, values := range buf.colbuf {
+		if _, err := buf.columns[columnIndex].WriteValues(values); err != nil {
+			// TODO: an error at this stage will leave the buffer in an invalid
+			// state since the row was partially written. Applications are not
+			// expected to continue using the buffer after getting an error,
+			// maybe we can enforce it?
+			return 0, err
+		}
+	}
+
+	return len(rows), nil
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.
@@ -221,7 +251,9 @@ func (buf *Buffer) WriteRowGroup(rowGroup RowGroup) (int64, error) {
 		return 0, ErrRowGroupSortingColumnsMismatch
 	}
 	n := buf.NumRows()
-	_, err := CopyRows(bufferWriter{buf}, rowGroup.Rows())
+	r := rowGroup.Rows()
+	defer r.Close()
+	_, err := CopyRows(bufferWriter{buf}, r)
 	return buf.NumRows() - n, err
 }
 
@@ -229,15 +261,15 @@ func (buf *Buffer) WriteRowGroup(rowGroup RowGroup) (int64, error) {
 //
 // The buffer and the returned reader share memory. Mutating the buffer
 // concurrently to reading rows may result in non-deterministic behavior.
-func (buf *Buffer) Rows() Rows { return &rowGroupRowReader{rowGroup: buf} }
+func (buf *Buffer) Rows() Rows { return newRowGroupRows(buf, ReadModeSync) }
 
 // bufferWriter is an adapter for Buffer which implements both RowWriter and
 // PageWriter to enable optimizations in CopyRows for types that support writing
 // rows by copying whole pages instead of calling WriteRow repeatedly.
 type bufferWriter struct{ buf *Buffer }
 
-func (w bufferWriter) WriteRow(row Row) error {
-	return w.buf.WriteRow(row)
+func (w bufferWriter) WriteRows(rows []Row) (int, error) {
+	return w.buf.WriteRows(rows)
 }
 
 func (w bufferWriter) WriteValues(values []Value) (int, error) {
@@ -256,4 +288,259 @@ var (
 	_ RowWriter   = (*bufferWriter)(nil)
 	_ PageWriter  = (*bufferWriter)(nil)
 	_ ValueWriter = (*bufferWriter)(nil)
+)
+
+type buffer struct {
+	data  []byte
+	refc  uintptr
+	pool  *bufferPool
+	stack []byte
+}
+
+func (b *buffer) refCount() int {
+	return int(atomic.LoadUintptr(&b.refc))
+}
+
+func (b *buffer) ref() {
+	atomic.AddUintptr(&b.refc, +1)
+}
+
+func (b *buffer) unref() {
+	if atomic.AddUintptr(&b.refc, ^uintptr(0)) == 0 {
+		if b.pool != nil {
+			b.pool.put(b)
+		}
+	}
+}
+
+func monitorBufferRelease(b *buffer) {
+	if rc := b.refCount(); rc != 0 {
+		log.Printf("PARQUETGODEBUG: buffer garbage collected with non-zero reference count\n%s", string(b.stack))
+	}
+}
+
+type bufferPool struct {
+	// Buckets are split in two groups for short and large buffers. In the short
+	// buffer group (below 256KB), the growth rate between each bucket is 2. The
+	// growth rate changes to 1.5 in the larger buffer group.
+	//
+	// Short buffer buckets:
+	// ---------------------
+	//   4K, 8K, 16K, 32K, 64K, 128K, 256K
+	//
+	// Large buffer buckets:
+	// ---------------------
+	//   364K, 546K, 819K ...
+	//
+	buckets [bufferPoolBucketCount]sync.Pool
+}
+
+func (p *bufferPool) newBuffer(bufferSize, bucketSize int) *buffer {
+	b := &buffer{
+		data: make([]byte, bufferSize, bucketSize),
+		refc: 1,
+		pool: p,
+	}
+	if debug.TRACEBUF > 0 {
+		b.stack = make([]byte, 4096)
+		runtime.SetFinalizer(b, monitorBufferRelease)
+	}
+	return b
+}
+
+// get returns a buffer from the levelled buffer pool. size is used to choose
+// the appropriate pool.
+func (p *bufferPool) get(bufferSize int) *buffer {
+	bucketIndex, bucketSize := bufferPoolBucketIndexAndSizeOfGet(bufferSize)
+
+	b := (*buffer)(nil)
+	if bucketIndex >= 0 {
+		b, _ = p.buckets[bucketIndex].Get().(*buffer)
+	}
+
+	if b == nil {
+		b = p.newBuffer(bufferSize, bucketSize)
+	} else {
+		b.data = b.data[:bufferSize]
+		b.ref()
+	}
+
+	if debug.TRACEBUF > 0 {
+		b.stack = b.stack[:runtime.Stack(b.stack[:cap(b.stack)], false)]
+	}
+	return b
+}
+
+func (p *bufferPool) put(b *buffer) {
+	if b.pool != p {
+		panic("BUG: buffer returned to a different pool than the one it was allocated from")
+	}
+	if b.refCount() != 0 {
+		panic("BUG: buffer returned to pool with a non-zero reference count")
+	}
+	if bucketIndex, _ := bufferPoolBucketIndexAndSizeOfPut(cap(b.data)); bucketIndex >= 0 {
+		p.buckets[bucketIndex].Put(b)
+	}
+}
+
+const (
+	bufferPoolBucketCount         = 32
+	bufferPoolMinSize             = 4096
+	bufferPoolLastShortBucketSize = 262144
+)
+
+func bufferPoolNextSize(size int) int {
+	if size < bufferPoolLastShortBucketSize {
+		return size * 2
+	} else {
+		return size + (size / 2)
+	}
+}
+
+func bufferPoolBucketIndexAndSizeOfGet(size int) (int, int) {
+	limit := bufferPoolMinSize
+
+	for i := 0; i < bufferPoolBucketCount; i++ {
+		if size <= limit {
+			return i, limit
+		}
+		limit = bufferPoolNextSize(limit)
+	}
+
+	return -1, size
+}
+
+func bufferPoolBucketIndexAndSizeOfPut(size int) (int, int) {
+	// When releasing buffers, some may have a capacity that is not one of the
+	// bucket sizes (due to the use of append for example). In this case, we
+	// have to put the buffer is the highest bucket with a size less or equal
+	// to the buffer capacity.
+	if limit := bufferPoolMinSize; size >= limit {
+		for i := 0; i < bufferPoolBucketCount; i++ {
+			n := bufferPoolNextSize(limit)
+			if size < n {
+				return i, limit
+			}
+			limit = n
+		}
+	}
+	return -1, size
+}
+
+var (
+	buffers bufferPool
+)
+
+type bufferedPage struct {
+	Page
+	values           *buffer
+	offsets          *buffer
+	repetitionLevels *buffer
+	definitionLevels *buffer
+}
+
+func newBufferedPage(page Page, values, offsets, definitionLevels, repetitionLevels *buffer) *bufferedPage {
+	p := &bufferedPage{
+		Page:             page,
+		values:           values,
+		offsets:          offsets,
+		definitionLevels: definitionLevels,
+		repetitionLevels: repetitionLevels,
+	}
+	bufferRef(values)
+	bufferRef(offsets)
+	bufferRef(definitionLevels)
+	bufferRef(repetitionLevels)
+	return p
+}
+
+func (p *bufferedPage) Slice(i, j int64) Page {
+	return newBufferedPage(
+		p.Page.Slice(i, j),
+		p.values,
+		p.offsets,
+		p.definitionLevels,
+		p.repetitionLevels,
+	)
+}
+
+func (p *bufferedPage) Retain() {
+	bufferRef(p.values)
+	bufferRef(p.offsets)
+	bufferRef(p.definitionLevels)
+	bufferRef(p.repetitionLevels)
+}
+
+func (p *bufferedPage) Release() {
+	bufferUnref(p.values)
+	bufferUnref(p.offsets)
+	bufferUnref(p.definitionLevels)
+	bufferUnref(p.repetitionLevels)
+}
+
+func bufferRef(buf *buffer) {
+	if buf != nil {
+		buf.ref()
+	}
+}
+
+func bufferUnref(buf *buffer) {
+	if buf != nil {
+		buf.unref()
+	}
+}
+
+// Retain is a helper function to increment the reference counter of pages
+// backed by memory which can be granularly managed by the application.
+//
+// Usage of this function is optional and with Release, is intended to allow
+// finer grain memory management in the application. Most programs should be
+// able to rely on automated memory management provided by the Go garbage
+// collector instead.
+//
+// The function should be called when a page lifetime is about to be shared
+// between multiple goroutines or layers of an application, and the program
+// wants to express "sharing ownership" of the page.
+//
+// Calling this function on pages that do not embed a reference counter does
+// nothing.
+func Retain(page Page) {
+	if p, _ := page.(retainable); p != nil {
+		p.Retain()
+	}
+}
+
+// Release is a helper function to decrement the reference counter of pages
+// backed by memory which can be granularly managed by the application.
+//
+// Usage of this is optional and with Retain, is intended to allow finer grained
+// memory management in the application, at the expense of potentially causing
+// panics if the page is used after its reference count has reached zero. Most
+// programs should be able to rely on automated memory management provided by
+// the Go garbage collector instead.
+//
+// The function should be called to return a page to the internal buffer pool,
+// when a goroutine "releases ownership" it acquired either by being the single
+// owner (e.g. capturing the return value from a ReadPage call) or having gotten
+// shared ownership by calling Retain.
+//
+// Calling this function on pages that do not embed a reference counter does
+// nothing.
+func Release(page Page) {
+	if p, _ := page.(releasable); p != nil {
+		p.Release()
+	}
+}
+
+type retainable interface {
+	Retain()
+}
+
+type releasable interface {
+	Release()
+}
+
+var (
+	_ retainable = (*bufferedPage)(nil)
+	_ releasable = (*bufferedPage)(nil)
 )

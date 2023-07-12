@@ -3,23 +3,22 @@ package parquet
 import (
 	"math/rand"
 	"testing"
-	"testing/quick"
 
 	"github.com/segmentio/parquet-go/bloom"
 	"github.com/segmentio/parquet-go/deprecated"
-	"github.com/segmentio/parquet-go/encoding"
+	"github.com/segmentio/parquet-go/internal/quick"
+	"github.com/segmentio/parquet-go/internal/unsafecast"
 )
 
-func TestBloomFilterEncoder(t *testing.T) {
-	newFilter := func(numValues int) *bloomFilterEncoder {
-		return newBloomFilterEncoder(
-			make(bloom.SplitBlockFilter, bloom.NumSplitBlocksOf(int64(numValues), 11)),
-			bloom.XXH64{},
-		)
+func TestSplitBlockFilter(t *testing.T) {
+	newFilter := func(numValues int) bloom.SplitBlockFilter {
+		return make(bloom.SplitBlockFilter, bloom.NumSplitBlocksOf(int64(numValues), 11))
 	}
 
-	check := func(e *bloomFilterEncoder, v Value) bool {
-		return e.filter.Check(v.hash(e.hash))
+	enc := SplitBlockFilter(10, "$").Encoding()
+
+	check := func(filter bloom.SplitBlockFilter, value Value) bool {
+		return filter.Check(value.hash(&bloom.XXH64{}))
 	}
 
 	tests := []struct {
@@ -29,10 +28,10 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "BOOLEAN",
 			function: func(values []bool) bool {
-				f := newFilter(len(values))
-				f.EncodeBoolean(values)
+				filter := newFilter(len(values))
+				enc.EncodeBoolean(filter.Bytes(), unsafecast.BoolToBytes(values))
 				for _, v := range values {
-					if !check(f, ValueOf(v)) {
+					if !check(filter, ValueOf(v)) {
 						return false
 					}
 				}
@@ -43,10 +42,10 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "INT32",
 			function: func(values []int32) bool {
-				f := newFilter(len(values))
-				f.EncodeInt32(values)
+				filter := newFilter(len(values))
+				enc.EncodeInt32(filter.Bytes(), values)
 				for _, v := range values {
-					if !check(f, ValueOf(v)) {
+					if !check(filter, ValueOf(v)) {
 						return false
 					}
 				}
@@ -57,10 +56,10 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "INT64",
 			function: func(values []int64) bool {
-				f := newFilter(len(values))
-				f.EncodeInt64(values)
+				filter := newFilter(len(values))
+				enc.EncodeInt64(filter.Bytes(), values)
 				for _, v := range values {
-					if !check(f, ValueOf(v)) {
+					if !check(filter, ValueOf(v)) {
 						return false
 					}
 				}
@@ -71,10 +70,10 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "INT96",
 			function: func(values []deprecated.Int96) bool {
-				f := newFilter(len(values))
-				f.EncodeInt96(values)
+				filter := newFilter(len(values))
+				enc.EncodeInt96(filter.Bytes(), values)
 				for _, v := range values {
-					if !check(f, ValueOf(v)) {
+					if !check(filter, ValueOf(v)) {
 						return false
 					}
 				}
@@ -85,10 +84,10 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "FLOAT",
 			function: func(values []float32) bool {
-				f := newFilter(len(values))
-				f.EncodeFloat(values)
+				filter := newFilter(len(values))
+				enc.EncodeFloat(filter.Bytes(), values)
 				for _, v := range values {
-					if !check(f, ValueOf(v)) {
+					if !check(filter, ValueOf(v)) {
 						return false
 					}
 				}
@@ -99,10 +98,10 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "DOUBLE",
 			function: func(values []float64) bool {
-				f := newFilter(len(values))
-				f.EncodeDouble(values)
+				filter := newFilter(len(values))
+				enc.EncodeDouble(filter.Bytes(), values)
 				for _, v := range values {
-					if !check(f, ValueOf(v)) {
+					if !check(filter, ValueOf(v)) {
 						return false
 					}
 				}
@@ -113,14 +112,17 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "BYTE_ARRAY",
 			function: func(values [][]byte) bool {
-				a := encoding.ByteArrayList{}
-				for _, v := range values {
-					a.Push(v)
+				content := make([]byte, 0, 512)
+				offsets := make([]uint32, len(values))
+				for _, value := range values {
+					offsets = append(offsets, uint32(len(content)))
+					content = append(content, value...)
 				}
-				f := newFilter(len(values))
-				f.EncodeByteArray(a)
+				offsets = append(offsets, uint32(len(content)))
+				filter := newFilter(len(values))
+				enc.EncodeByteArray(filter.Bytes(), content, offsets)
 				for _, v := range values {
-					if !check(f, ValueOf(v)) {
+					if !check(filter, ValueOf(v)) {
 						return false
 					}
 				}
@@ -131,10 +133,10 @@ func TestBloomFilterEncoder(t *testing.T) {
 		{
 			scenario: "FIXED_LEN_BYTE_ARRAY",
 			function: func(values []byte) bool {
-				f := newFilter(len(values))
-				f.EncodeFixedLenByteArray(1, values)
+				filter := newFilter(len(values))
+				enc.EncodeFixedLenByteArray(filter.Bytes(), values, 1)
 				for _, v := range values {
-					if !check(f, ValueOf([1]byte{v})) {
+					if !check(filter, ValueOf([1]byte{v})) {
 						return false
 					}
 				}
@@ -145,42 +147,17 @@ func TestBloomFilterEncoder(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.scenario, func(t *testing.T) {
-			if err := quick.Check(test.function, nil); err != nil {
-				t.Fatal(err)
+			if err := quick.Check(test.function); err != nil {
+				t.Error(err)
 			}
 		})
 	}
-
-	t.Run("Reset", func(t *testing.T) {
-		f := newFilter(1)
-		f.EncodeBoolean([]bool{false, true})
-
-		allZeros := true
-		for _, b := range f.Bytes() {
-			if b != 0 {
-				allZeros = false
-				break
-			}
-		}
-		if allZeros {
-			t.Fatal("bloom filter bytes were all zero after encoding values")
-		}
-
-		f.Reset(nil)
-		for i, b := range f.Bytes() {
-			if b != 0 {
-				t.Fatalf("bloom filter byte at index %d was not zero after resetting the encoder: %02X", i, b)
-			}
-		}
-	})
 }
 
-func BenchmarkBloomFilterEncoder(b *testing.B) {
+func BenchmarkSplitBlockFilter(b *testing.B) {
 	const N = 1000
-	f := newBloomFilterEncoder(
-		make(bloom.SplitBlockFilter, bloom.NumSplitBlocksOf(N, 10)),
-		bloom.XXH64{},
-	)
+	f := make(bloom.SplitBlockFilter, bloom.NumSplitBlocksOf(N, 10)).Bytes()
+	e := SplitBlockFilter(10, "$").Encoding()
 
 	v := make([]int64, N)
 	r := rand.NewSource(10)
@@ -189,7 +166,7 @@ func BenchmarkBloomFilterEncoder(b *testing.B) {
 	}
 
 	for i := 0; i < b.N; i++ {
-		f.EncodeInt64(v)
+		e.EncodeInt64(f, v)
 	}
 
 	b.SetBytes(8 * N)

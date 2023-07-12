@@ -2,23 +2,21 @@ package parquet
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/segmentio/encoding/thrift"
-	"github.com/segmentio/parquet-go/encoding"
 	"github.com/segmentio/parquet-go/format"
 )
 
 const (
-	defaultReadBufferSize  = 4096
-	defaultLevelBufferSize = 1024
+	defaultDictBufferSize = 8192
+	defaultReadBufferSize = 4096
 )
 
 // File represents a parquet file. The layout of a Parquet file can be found
@@ -28,10 +26,12 @@ type File struct {
 	protocol      thrift.CompactProtocol
 	reader        io.ReaderAt
 	size          int64
+	schema        *Schema
 	root          *Column
 	columnIndexes []format.ColumnIndex
 	offsetIndexes []format.OffsetIndex
-	rowGroups     []fileRowGroup
+	rowGroups     []RowGroup
+	config        *FileConfig
 }
 
 // OpenFile opens a parquet file and reads the content between offset 0 and the given
@@ -42,11 +42,11 @@ type File struct {
 // a file does not validate that the pages have valid checksums.
 func OpenFile(r io.ReaderAt, size int64, options ...FileOption) (*File, error) {
 	b := make([]byte, 8)
-	f := &File{reader: r, size: size}
 	c, err := NewFileConfig(options...)
 	if err != nil {
 		return nil, err
 	}
+	f := &File{reader: r, size: size, config: c}
 
 	if _, err := r.ReadAt(b[:4], 0); err != nil {
 		return nil, fmt.Errorf("reading magic header of parquet file: %w", err)
@@ -55,7 +55,10 @@ func OpenFile(r io.ReaderAt, size int64, options ...FileOption) (*File, error) {
 		return nil, fmt.Errorf("invalid magic header of parquet file: %q", b[:4])
 	}
 
-	if _, err := r.ReadAt(b[:8], size-8); err != nil {
+	if cast, ok := f.reader.(interface{ SetMagicFooterSection(offset, length int64) }); ok {
+		cast.SetMagicFooterSection(size-8, 8)
+	}
+	if n, err := r.ReadAt(b[:8], size-8); n != 8 {
 		return nil, fmt.Errorf("reading magic footer of parquet file: %w", err)
 	}
 	if string(b[4:8]) != "PAR1" {
@@ -63,11 +66,15 @@ func OpenFile(r io.ReaderAt, size int64, options ...FileOption) (*File, error) {
 	}
 
 	footerSize := int64(binary.LittleEndian.Uint32(b[:4]))
-	section := acquireBufferedSectionReader(r, size-(footerSize+8), footerSize)
-	decoder := thrift.NewDecoder(f.protocol.NewReader(section))
-	defer releaseBufferedSectionReader(section)
+	footerData := make([]byte, footerSize)
 
-	if err := decoder.Decode(&f.metadata); err != nil {
+	if cast, ok := f.reader.(interface{ SetFooterSection(offset, length int64) }); ok {
+		cast.SetFooterSection(size-(footerSize+8), footerSize)
+	}
+	if _, err := f.reader.ReadAt(footerData, size-(footerSize+8)); err != nil {
+		return nil, fmt.Errorf("reading footer of parquet file: %w", err)
+	}
+	if err := thrift.Unmarshal(&f.protocol, footerData, &f.metadata); err != nil {
 		return nil, fmt.Errorf("reading parquet file metadata: %w", err)
 	}
 	if len(f.metadata.Schema) == 0 {
@@ -75,7 +82,7 @@ func OpenFile(r io.ReaderAt, size int64, options ...FileOption) (*File, error) {
 	}
 
 	if !c.SkipPageIndex {
-		if f.columnIndexes, f.offsetIndexes, err = f.readPageIndex(section, decoder); err != nil {
+		if f.columnIndexes, f.offsetIndexes, err = f.ReadPageIndex(); err != nil {
 			return nil, fmt.Errorf("reading page index of parquet file: %w", err)
 		}
 	}
@@ -84,35 +91,59 @@ func OpenFile(r io.ReaderAt, size int64, options ...FileOption) (*File, error) {
 		return nil, fmt.Errorf("opening columns of parquet file: %w", err)
 	}
 
-	schema := NewSchema(f.root.Name(), f.root)
-	columns := make([]*Column, 0, MaxColumnIndex+1)
+	var schema *Schema
+	if c.Schema != nil {
+		schema = c.Schema
+	} else {
+		schema = NewSchema(f.root.Name(), f.root)
+	}
+	columns := make([]*Column, 0, numLeafColumnsOf(f.root))
+	f.schema = schema
 	f.root.forEachLeaf(func(c *Column) { columns = append(columns, c) })
 
-	f.rowGroups = make([]fileRowGroup, len(f.metadata.RowGroups))
-	for i := range f.rowGroups {
-		f.rowGroups[i].init(f, schema, columns, &f.metadata.RowGroups[i])
+	rowGroups := make([]fileRowGroup, len(f.metadata.RowGroups))
+	for i := range rowGroups {
+		rowGroups[i].init(f, schema, columns, &f.metadata.RowGroups[i])
+	}
+	f.rowGroups = make([]RowGroup, len(rowGroups))
+	for i := range rowGroups {
+		f.rowGroups[i] = &rowGroups[i]
 	}
 
 	if !c.SkipBloomFilters {
-		h := format.BloomFilterHeader{}
-		p := thrift.CompactProtocol{}
-		s := io.NewSectionReader(r, 0, size)
-		d := thrift.NewDecoder(p.NewReader(s))
+		section := io.NewSectionReader(r, 0, size)
+		rbuf, rbufpool := getBufioReader(section, c.ReadBufferSize)
+		defer putBufioReader(rbuf, rbufpool)
 
-		for i := range f.rowGroups {
-			g := &f.rowGroups[i]
+		header := format.BloomFilterHeader{}
+		compact := thrift.CompactProtocol{}
+		decoder := thrift.NewDecoder(compact.NewReader(rbuf))
+
+		for i := range rowGroups {
+			g := &rowGroups[i]
 
 			for j := range g.columns {
-				c := &g.columns[j]
+				c := g.columns[j].(*fileColumnChunk)
 
 				if offset := c.chunk.MetaData.BloomFilterOffset; offset > 0 {
-					s.Seek(offset, io.SeekStart)
-					h = format.BloomFilterHeader{}
-					if err := d.Decode(&h); err != nil {
-						return nil, err
+					section.Seek(offset, io.SeekStart)
+					rbuf.Reset(section)
+
+					header = format.BloomFilterHeader{}
+					if err := decoder.Decode(&header); err != nil {
+						return nil, fmt.Errorf("decoding bloom filter header: %w", err)
 					}
-					offset, _ = s.Seek(0, io.SeekCurrent)
-					c.bloomFilter = newBloomFilter(r, offset, &h)
+
+					offset, _ = section.Seek(0, io.SeekCurrent)
+					offset -= int64(rbuf.Buffered())
+
+					if cast, ok := r.(interface{ SetBloomFilterSection(offset, length int64) }); ok {
+						bloomFilterOffset := c.chunk.MetaData.BloomFilterOffset
+						bloomFilterLength := (offset - bloomFilterOffset) + int64(header.NumBytes)
+						cast.SetBloomFilterSection(bloomFilterOffset, bloomFilterLength)
+					}
+
+					c.bloomFilter = newBloomFilter(r, offset, &header)
 				}
 			}
 		}
@@ -130,89 +161,137 @@ func OpenFile(r io.ReaderAt, size int64, options ...FileOption) (*File, error) {
 // Only leaf columns have indexes, the returned indexes are arranged using the
 // following layout:
 //
-//	+ -------------- +
+//	------------------
 //	| col 0: chunk 0 |
-//	+ -------------- +
+//	------------------
 //	| col 1: chunk 0 |
-//	+ -------------- +
+//	------------------
 //	| ...            |
-//	+ -------------- +
+//	------------------
 //	| col 0: chunk 1 |
-//	+ -------------- +
+//	------------------
 //	| col 1: chunk 1 |
-//	+ -------------- +
+//	------------------
 //	| ...            |
-//	+ -------------- +
+//	------------------
 //
 // This method is useful in combination with the SkipPageIndex option to delay
 // reading the page index section until after the file was opened. Note that in
 // this case the page index is not cached within the file, programs are expected
 // to make use of independently from the parquet package.
 func (f *File) ReadPageIndex() ([]format.ColumnIndex, []format.OffsetIndex, error) {
-	section := acquireBufferedSectionReader(nil, 0, 0)
-	decoder := thrift.NewDecoder(f.protocol.NewReader(section))
-	defer releaseBufferedSectionReader(section)
-	return f.readPageIndex(section, decoder)
-}
-
-func (f *File) readPageIndex(section *bufferedSectionReader, decoder *thrift.Decoder) ([]format.ColumnIndex, []format.OffsetIndex, error) {
-	if len(f.metadata.RowGroups) == 0 || len(f.metadata.RowGroups[0].Columns) == 0 {
+	if len(f.metadata.RowGroups) == 0 {
 		return nil, nil, nil
 	}
 
-	indexOffset := f.metadata.RowGroups[0].Columns[0].ColumnIndexOffset
-	indexLength := int64(0)
+	columnIndexOffset := f.metadata.RowGroups[0].Columns[0].ColumnIndexOffset
+	offsetIndexOffset := f.metadata.RowGroups[0].Columns[0].OffsetIndexOffset
+	columnIndexLength := int64(0)
+	offsetIndexLength := int64(0)
 
-	if indexOffset == 0 {
-		// A zero offset means that the file does not contain a column index.
+	forEachColumnChunk := func(do func(int, int, *format.ColumnChunk) error) error {
+		for i := range f.metadata.RowGroups {
+			for j := range f.metadata.RowGroups[i].Columns {
+				c := &f.metadata.RowGroups[i].Columns[j]
+				if err := do(i, j, c); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	forEachColumnChunk(func(_, _ int, c *format.ColumnChunk) error {
+		columnIndexLength += int64(c.ColumnIndexLength)
+		offsetIndexLength += int64(c.OffsetIndexLength)
+		return nil
+	})
+
+	if columnIndexLength == 0 && offsetIndexLength == 0 {
 		return nil, nil, nil
 	}
 
-	for i := range f.metadata.RowGroups {
-		for j := range f.metadata.RowGroups[i].Columns {
-			indexLength += int64(f.metadata.RowGroups[i].Columns[j].ColumnIndexLength)
-			indexLength += int64(f.metadata.RowGroups[i].Columns[j].OffsetIndexLength)
+	numRowGroups := len(f.metadata.RowGroups)
+	numColumns := len(f.metadata.RowGroups[0].Columns)
+	numColumnChunks := numRowGroups * numColumns
+
+	columnIndexes := make([]format.ColumnIndex, numColumnChunks)
+	offsetIndexes := make([]format.OffsetIndex, numColumnChunks)
+	indexBuffer := make([]byte, max(int(columnIndexLength), int(offsetIndexLength)))
+
+	if columnIndexOffset > 0 {
+		columnIndexData := indexBuffer[:columnIndexLength]
+
+		if cast, ok := f.reader.(interface{ SetColumnIndexSection(offset, length int64) }); ok {
+			cast.SetColumnIndexSection(columnIndexOffset, columnIndexLength)
+		}
+		if _, err := f.reader.ReadAt(columnIndexData, columnIndexOffset); err != nil {
+			return nil, nil, fmt.Errorf("reading %d bytes column index at offset %d: %w", columnIndexLength, columnIndexOffset, err)
+		}
+
+		err := forEachColumnChunk(func(i, j int, c *format.ColumnChunk) error {
+			// Some parquet files are missing the column index on some columns.
+			//
+			// An example of this file is testdata/alltypes_tiny_pages_plain.parquet
+			// which was added in https://github.com/apache/parquet-testing/pull/24.
+			if c.ColumnIndexOffset > 0 {
+				offset := c.ColumnIndexOffset - columnIndexOffset
+				length := int64(c.ColumnIndexLength)
+				buffer := columnIndexData[offset : offset+length]
+				if err := thrift.Unmarshal(&f.protocol, buffer, &columnIndexes[(i*numColumns)+j]); err != nil {
+					return fmt.Errorf("decoding column index: rowGroup=%d columnChunk=%d/%d: %w", i, j, numColumns, err)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 
-	numColumnChunks := len(f.metadata.RowGroups) * len(f.metadata.RowGroups[0].Columns)
-	columnIndexes := make([]format.ColumnIndex, 0, numColumnChunks)
-	offsetIndexes := make([]format.OffsetIndex, 0, numColumnChunks)
-	section.Reset(f.reader, indexOffset, indexLength)
+	if offsetIndexOffset > 0 {
+		offsetIndexData := indexBuffer[:offsetIndexLength]
 
-	for i := range f.metadata.RowGroups {
-		for j := range f.metadata.RowGroups[i].Columns {
-			n := len(columnIndexes)
-			columnIndexes = append(columnIndexes, format.ColumnIndex{})
-
-			if err := decoder.Decode(&columnIndexes[n]); err != nil {
-				return nil, nil, fmt.Errorf("reading column index %d of row group %d: %w", j, i, err)
-			}
+		if cast, ok := f.reader.(interface{ SetOffsetIndexSection(offset, length int64) }); ok {
+			cast.SetOffsetIndexSection(offsetIndexOffset, offsetIndexLength)
 		}
-	}
+		if _, err := f.reader.ReadAt(offsetIndexData, offsetIndexOffset); err != nil {
+			return nil, nil, fmt.Errorf("reading %d bytes offset index at offset %d: %w", offsetIndexLength, offsetIndexOffset, err)
+		}
 
-	for i := range f.metadata.RowGroups {
-		for j := range f.metadata.RowGroups[i].Columns {
-			n := len(offsetIndexes)
-			offsetIndexes = append(offsetIndexes, format.OffsetIndex{})
-
-			if err := decoder.Decode(&offsetIndexes[n]); err != nil {
-				return nil, nil, fmt.Errorf("reading offset index %d of row group %d: %w", j, i, err)
+		err := forEachColumnChunk(func(i, j int, c *format.ColumnChunk) error {
+			if c.OffsetIndexOffset > 0 {
+				offset := c.OffsetIndexOffset - offsetIndexOffset
+				length := int64(c.OffsetIndexLength)
+				buffer := offsetIndexData[offset : offset+length]
+				if err := thrift.Unmarshal(&f.protocol, buffer, &offsetIndexes[(i*numColumns)+j]); err != nil {
+					return fmt.Errorf("decoding column index: rowGroup=%d columnChunk=%d/%d: %w", i, j, numColumns, err)
+				}
 			}
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
 		}
 	}
 
 	return columnIndexes, offsetIndexes, nil
 }
 
-// NumRowGroups returns the number of row groups in f.
-func (f *File) NumRowGroups() int { return len(f.rowGroups) }
+// NumRows returns the number of rows in the file.
+func (f *File) NumRows() int64 { return f.metadata.NumRows }
 
-// RowGroup returns the row group at the given index in f.
-func (f *File) RowGroup(i int) RowGroup { return &f.rowGroups[i] }
+// RowGroups returns the list of row groups in the file.
+func (f *File) RowGroups() []RowGroup { return f.rowGroups }
 
 // Root returns the root column of f.
 func (f *File) Root() *Column { return f.root }
+
+// Schema returns the schema of f.
+func (f *File) Schema() *Schema { return f.schema }
+
+// Metadata returns the metadata of f.
+func (f *File) Metadata() *format.FileMetaData { return &f.metadata }
 
 // Size returns the size of f (in bytes).
 func (f *File) Size() int64 { return f.size }
@@ -260,42 +339,7 @@ func (f *File) hasIndexes() bool {
 	return f.columnIndexes != nil && f.offsetIndexes != nil
 }
 
-var (
-	_ io.ReaderAt = (*File)(nil)
-
-	bufferedSectionReaderPool sync.Pool
-)
-
-type bufferedSectionReader struct {
-	section io.SectionReader
-	bufio.Reader
-}
-
-func newBufferedSectionReader(r io.ReaderAt, offset, length int64) *bufferedSectionReader {
-	b := &bufferedSectionReader{section: *io.NewSectionReader(r, offset, length)}
-	b.Reader = *bufio.NewReaderSize(&b.section, defaultReadBufferSize)
-	return b
-}
-
-func (b *bufferedSectionReader) Reset(r io.ReaderAt, offset, length int64) {
-	b.section = *io.NewSectionReader(r, offset, length)
-	b.Reader.Reset(&b.section)
-}
-
-func acquireBufferedSectionReader(r io.ReaderAt, offset, length int64) *bufferedSectionReader {
-	b, _ := bufferedSectionReaderPool.Get().(*bufferedSectionReader)
-	if b == nil {
-		b = newBufferedSectionReader(r, offset, length)
-	} else {
-		b.Reset(r, offset, length)
-	}
-	return b
-}
-
-func releaseBufferedSectionReader(b *bufferedSectionReader) {
-	b.Reset(nil, 0, 0)
-	bufferedSectionReaderPool.Put(b)
-}
+var _ io.ReaderAt = (*File)(nil)
 
 func sortKeyValueMetadata(keyValueMetadata []format.KeyValue) {
 	sort.Slice(keyValueMetadata, func(i, j int) bool {
@@ -323,18 +367,21 @@ func lookupKeyValueMetadata(keyValueMetadata []format.KeyValue, key string) (val
 type fileRowGroup struct {
 	schema   *Schema
 	rowGroup *format.RowGroup
-	columns  []fileColumnChunk
+	columns  []ColumnChunk
 	sorting  []SortingColumn
+	config   *FileConfig
 }
 
 func (g *fileRowGroup) init(file *File, schema *Schema, columns []*Column, rowGroup *format.RowGroup) {
 	g.schema = schema
 	g.rowGroup = rowGroup
-	g.columns = make([]fileColumnChunk, len(rowGroup.Columns))
+	g.config = file.config
+	g.columns = make([]ColumnChunk, len(rowGroup.Columns))
 	g.sorting = make([]SortingColumn, len(rowGroup.SortingColumns))
+	fileColumnChunks := make([]fileColumnChunk, len(rowGroup.Columns))
 
 	for i := range g.columns {
-		c := fileColumnChunk{
+		fileColumnChunks[i] = fileColumnChunk{
 			file:     file,
 			column:   columns[i],
 			rowGroup: rowGroup,
@@ -343,11 +390,11 @@ func (g *fileRowGroup) init(file *File, schema *Schema, columns []*Column, rowGr
 
 		if file.hasIndexes() {
 			j := (int(rowGroup.Ordinal) * len(columns)) + i
-			c.columnIndex = &file.columnIndexes[j]
-			c.offsetIndex = &file.offsetIndexes[j]
+			fileColumnChunks[i].columnIndex = &file.columnIndexes[j]
+			fileColumnChunks[i].offsetIndex = &file.offsetIndexes[j]
 		}
 
-		g.columns[i] = c
+		g.columns[i] = &fileColumnChunks[i]
 	}
 
 	for i := range g.sorting {
@@ -361,10 +408,9 @@ func (g *fileRowGroup) init(file *File, schema *Schema, columns []*Column, rowGr
 
 func (g *fileRowGroup) Schema() *Schema                 { return g.schema }
 func (g *fileRowGroup) NumRows() int64                  { return g.rowGroup.NumRows }
-func (g *fileRowGroup) NumColumns() int                 { return len(g.columns) }
-func (g *fileRowGroup) Column(i int) ColumnChunk        { return &g.columns[i] }
+func (g *fileRowGroup) ColumnChunks() []ColumnChunk     { return g.columns }
 func (g *fileRowGroup) SortingColumns() []SortingColumn { return g.sorting }
-func (g *fileRowGroup) Rows() Rows                      { return &rowGroupRowReader{rowGroup: g} }
+func (g *fileRowGroup) Rows() Rows                      { return newRowGroupRows(g, g.config.ReadMode) }
 
 type fileSortingColumn struct {
 	column     *Column
@@ -375,6 +421,20 @@ type fileSortingColumn struct {
 func (s *fileSortingColumn) Path() []string   { return s.column.Path() }
 func (s *fileSortingColumn) Descending() bool { return s.descending }
 func (s *fileSortingColumn) NullsFirst() bool { return s.nullsFirst }
+func (s *fileSortingColumn) String() string {
+	b := new(strings.Builder)
+	if s.nullsFirst {
+		b.WriteString("nulls_first+")
+	}
+	if s.descending {
+		b.WriteString("descending(")
+	} else {
+		b.WriteString("ascending(")
+	}
+	b.WriteString(columnPath(s.Path()).String())
+	b.WriteString(")")
+	return b.String()
+}
 
 type fileColumnChunk struct {
 	file        *File
@@ -396,41 +456,22 @@ func (c *fileColumnChunk) Column() int {
 
 func (c *fileColumnChunk) Pages() Pages {
 	r := new(filePages)
-	c.setPagesOn(r)
+	r.init(c)
 	return r
-}
-
-func (c *fileColumnChunk) setPagesOn(r *filePages) {
-	r.column = c
-	r.page = filePage{
-		column:     c.column,
-		columnType: c.column.Type(),
-		codec:      c.chunk.MetaData.Codec,
-	}
-	r.baseOffset = c.chunk.MetaData.DataPageOffset
-	r.dataOffset = r.baseOffset
-	if c.chunk.MetaData.DictionaryPageOffset != 0 {
-		r.baseOffset = c.chunk.MetaData.DictionaryPageOffset
-		r.dictOffset = r.baseOffset
-	}
-	r.section = io.NewSectionReader(c.file, r.baseOffset, c.chunk.MetaData.TotalCompressedSize)
-	r.rbuf = bufio.NewReaderSize(r.section, defaultReadBufferSize)
-	r.section.Seek(r.dataOffset-r.baseOffset, io.SeekStart)
-	r.decoder.Reset(r.protocol.NewReader(r.rbuf))
 }
 
 func (c *fileColumnChunk) ColumnIndex() ColumnIndex {
 	if c.columnIndex == nil {
 		return nil
 	}
-	return (*columnIndex)(c.columnIndex)
+	return fileColumnIndex{c}
 }
 
 func (c *fileColumnChunk) OffsetIndex() OffsetIndex {
 	if c.offsetIndex == nil {
 		return nil
 	}
-	return (*offsetIndex)(c.offsetIndex)
+	return (*fileOffsetIndex)(c.offsetIndex)
 }
 
 func (c *fileColumnChunk) BloomFilter() BloomFilter {
@@ -445,71 +486,178 @@ func (c *fileColumnChunk) NumValues() int64 {
 }
 
 type filePages struct {
-	column     *fileColumnChunk
-	protocol   thrift.CompactProtocol
-	decoder    thrift.Decoder
+	chunk    *fileColumnChunk
+	rbuf     *bufio.Reader
+	rbufpool *sync.Pool
+	section  io.SectionReader
+
+	protocol thrift.CompactProtocol
+	decoder  thrift.Decoder
+
 	baseOffset int64
-	dictOffset int64
 	dataOffset int64
+	dictOffset int64
+	index      int
+	skip       int64
+	dictionary Dictionary
 
-	section *io.SectionReader
-	rbuf    *bufio.Reader
-
-	// This buffer holds compressed pages in memory when they are read; we need
-	// to read whole pages because we have to compute the checksum prior to
-	// exposing the page to the application.
-	compressedPageData []byte
-
-	page filePage
-	skip int64
+	bufferSize int
 }
 
-func (r *filePages) readPage() (*filePage, error) {
-	h := &r.page.header
-	h.Type = 0
-	h.UncompressedPageSize = 0
-	h.CompressedPageSize = 0
-	h.CRC = 0
+func (f *filePages) init(c *fileColumnChunk) {
+	f.chunk = c
+	f.baseOffset = c.chunk.MetaData.DataPageOffset
+	f.dataOffset = f.baseOffset
+	f.bufferSize = c.file.config.ReadBufferSize
 
-	if h.DataPageHeader != nil {
-		*h.DataPageHeader = format.DataPageHeader{}
-	}
-	if h.IndexPageHeader != nil {
-		h.IndexPageHeader = nil
-	}
-	if h.DictionaryPageHeader != nil {
-		*h.DictionaryPageHeader = format.DictionaryPageHeader{}
-	}
-	if h.DataPageHeaderV2 != nil {
-		*h.DataPageHeaderV2 = format.DataPageHeaderV2{}
+	if c.chunk.MetaData.DictionaryPageOffset != 0 {
+		f.baseOffset = c.chunk.MetaData.DictionaryPageOffset
+		f.dictOffset = f.baseOffset
 	}
 
-	if err := r.decoder.Decode(h); err != nil {
-		if err != io.EOF {
-			err = fmt.Errorf("decoding page header: %w", err)
+	f.section = *io.NewSectionReader(c.file, f.baseOffset, c.chunk.MetaData.TotalCompressedSize)
+	f.rbuf, f.rbufpool = getBufioReader(&f.section, f.bufferSize)
+	f.decoder.Reset(f.protocol.NewReader(f.rbuf))
+}
+
+func (f *filePages) ReadPage() (Page, error) {
+	if f.chunk == nil {
+		return nil, io.EOF
+	}
+
+	header := getPageHeader()
+	defer putPageHeader(header)
+
+	for {
+		if err := f.decoder.Decode(header); err != nil {
+			return nil, err
 		}
-		if r.page.values != nil {
-			r.page.values.release()
-			r.page.values = nil
+		data, err := f.readPage(header, f.rbuf)
+		if err != nil {
+			return nil, err
 		}
+
+		var page Page
+		switch header.Type {
+		case format.DataPageV2:
+			page, err = f.readDataPageV2(header, data)
+		case format.DataPage:
+			page, err = f.readDataPageV1(header, data)
+		case format.DictionaryPage:
+			// Sometimes parquet files do not have the dictionary page offset
+			// recorded in the column metadata. We account for this by lazily
+			// reading dictionary pages when we encounter them.
+			err = f.readDictionaryPage(header, data)
+		default:
+			err = fmt.Errorf("cannot read values of type %s from page", header.Type)
+		}
+
+		data.unref()
+
+		if err != nil {
+			return nil, fmt.Errorf("decoding page %d of column %q: %w", f.index, f.columnPath(), err)
+		}
+
+		if page == nil {
+			continue
+		}
+
+		f.index++
+		if f.skip == 0 {
+			return page, nil
+		}
+
+		// TODO: what about pages that don't embed the number of rows?
+		// (data page v1 with no offset index in the column chunk).
+		numRows := page.NumRows()
+
+		if numRows <= f.skip {
+			Release(page)
+		} else {
+			tail := page.Slice(f.skip, numRows)
+			Release(page)
+			f.skip = 0
+			return tail, nil
+		}
+
+		f.skip -= numRows
+	}
+}
+
+func (f *filePages) readDictionary() error {
+	chunk := io.NewSectionReader(f.chunk.file, f.baseOffset, f.chunk.chunk.MetaData.TotalCompressedSize)
+	rbuf, pool := getBufioReader(chunk, f.bufferSize)
+	defer putBufioReader(rbuf, pool)
+
+	decoder := thrift.NewDecoder(f.protocol.NewReader(rbuf))
+
+	header := getPageHeader()
+	defer putPageHeader(header)
+
+	if err := decoder.Decode(header); err != nil {
+		return err
+	}
+
+	page := buffers.get(int(header.CompressedPageSize))
+	defer page.unref()
+
+	if _, err := io.ReadFull(rbuf, page.data); err != nil {
+		return err
+	}
+
+	return f.readDictionaryPage(header, page)
+}
+
+func (f *filePages) readDictionaryPage(header *format.PageHeader, page *buffer) error {
+	if header.DictionaryPageHeader == nil {
+		return ErrMissingPageHeader
+	}
+	d, err := f.chunk.column.decodeDictionary(DictionaryPageHeader{header.DictionaryPageHeader}, page, header.UncompressedPageSize)
+	if err != nil {
+		return err
+	}
+	f.dictionary = d
+	return nil
+}
+
+func (f *filePages) readDataPageV1(header *format.PageHeader, page *buffer) (Page, error) {
+	if header.DataPageHeader == nil {
+		return nil, ErrMissingPageHeader
+	}
+	if isDictionaryFormat(header.DataPageHeader.Encoding) && f.dictionary == nil {
+		if err := f.readDictionary(); err != nil {
+			return nil, err
+		}
+	}
+	return f.chunk.column.decodeDataPageV1(DataPageHeaderV1{header.DataPageHeader}, page, f.dictionary, header.UncompressedPageSize)
+}
+
+func (f *filePages) readDataPageV2(header *format.PageHeader, page *buffer) (Page, error) {
+	if header.DataPageHeaderV2 == nil {
+		return nil, ErrMissingPageHeader
+	}
+	if isDictionaryFormat(header.DataPageHeaderV2.Encoding) && f.dictionary == nil {
+		// If the program seeked to a row passed the first page, the dictionary
+		// page may not have been seen, in which case we have to lazily load it
+		// from the beginning of column chunk.
+		if err := f.readDictionary(); err != nil {
+			return nil, err
+		}
+	}
+	return f.chunk.column.decodeDataPageV2(DataPageHeaderV2{header.DataPageHeaderV2}, page, f.dictionary, header.UncompressedPageSize)
+}
+
+func (f *filePages) readPage(header *format.PageHeader, reader *bufio.Reader) (*buffer, error) {
+	page := buffers.get(int(header.CompressedPageSize))
+	defer page.unref()
+
+	if _, err := io.ReadFull(reader, page.data); err != nil {
 		return nil, err
 	}
 
-	compressedPageSize := int(r.page.header.CompressedPageSize)
-	if cap(r.compressedPageData) < compressedPageSize {
-		r.compressedPageData = make([]byte, compressedPageSize)
-	} else {
-		r.compressedPageData = r.compressedPageData[:compressedPageSize]
-	}
-
-	_, err := io.ReadFull(r.rbuf, r.compressedPageData)
-	if err != nil {
-		return nil, fmt.Errorf("reading page %d of column %q", r.page.index, r.page.columnPath())
-	}
-
-	if r.page.header.CRC != 0 {
-		headerChecksum := uint32(r.page.header.CRC)
-		bufferChecksum := crc32.ChecksumIEEE(r.compressedPageData)
+	if header.CRC != 0 {
+		headerChecksum := uint32(header.CRC)
+		bufferChecksum := crc32.ChecksumIEEE(page.data)
 
 		if headerChecksum != bufferChecksum {
 			// The parquet specs indicate that corruption errors could be
@@ -520,9 +668,8 @@ func (r *filePages) readPage() (*filePage, error) {
 			// For now, we assume these errors to be fatal, but we may
 			// revisit later and improve error handling to be more resilient
 			// to data corruption.
-			return nil, fmt.Errorf("crc32 checksum mismatch in page %d of column %q: 0x%08X != 0x%08X: %w",
-				r.page.index,
-				r.page.columnPath(),
+			return nil, fmt.Errorf("crc32 checksum mismatch in page of column %q: want=0x%08X got=0x%08X: %w",
+				f.columnPath(),
 				headerChecksum,
 				bufferChecksum,
 				ErrCorrupted,
@@ -530,552 +677,107 @@ func (r *filePages) readPage() (*filePage, error) {
 		}
 	}
 
-	r.page.data.Reset(r.compressedPageData)
+	page.ref()
+	return page, nil
+}
 
-	if r.column.columnIndex != nil {
-		err = r.page.parseColumnIndex(r.column.columnIndex)
+func (f *filePages) SeekToRow(rowIndex int64) (err error) {
+	if f.chunk == nil {
+		return io.ErrClosedPipe
+	}
+	if f.chunk.offsetIndex == nil {
+		_, err = f.section.Seek(f.dataOffset-f.baseOffset, io.SeekStart)
+		f.skip = rowIndex
+		f.index = 0
+		if f.dictOffset > 0 {
+			f.index = 1
+		}
 	} else {
-		err = r.page.parseStatistics()
-	}
-	return &r.page, err
-}
-
-func (r *filePages) readDictionary() error {
-	r.page.dictionary = r.page.columnType.NewDictionary(0) // TODO: configure buffer size
-	r.page.columnType = r.page.dictionary.Type()
-	currentOffset, _ := r.section.Seek(0, io.SeekCurrent)
-	defer func() {
-		r.section.Seek(currentOffset, io.SeekStart)
-		r.rbuf.Reset(r.section)
-	}()
-
-	if _, err := r.section.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seeking to dictionary page offset: %w", err)
-	}
-	r.rbuf.Reset(r.section)
-
-	p, err := r.readPage()
-	if err != nil {
-		return err
-	}
-
-	dict := r.page.dictionary
-	page := acquireCompressedPageReader(p.codec, &p.data)
-
-	enc := r.page.header.DictionaryPageHeader.Encoding
-	dec := LookupEncoding(enc).NewDecoder(page)
-
-	dict.Reset()
-	err = dict.ReadFrom(dec)
-	releaseCompressedPageReader(page)
-
-	if err != nil {
-		return fmt.Errorf("reading dictionary of column %q: %w", p.columnPath(), err)
-	}
-	return nil
-}
-
-func (r *filePages) ReadPage() (Page, error) {
-	if r.page.dictionary == nil && r.dictOffset > 0 {
-		if err := r.readDictionary(); err != nil {
-			return nil, err
-		}
-	}
-	for {
-		p, err := r.readPage()
-		if err != nil {
-			return nil, err
-		}
-		p.index++
-		if r.skip == 0 {
-			return p, nil
-		}
-		numRows := p.NumRows()
-		if numRows > r.skip {
-			seek := r.skip
-			r.skip = 0
-			if seek > 0 {
-				return p.Buffer().Slice(seek, numRows), nil
-			}
-			return p, nil
-		}
-		r.skip -= numRows
-	}
-}
-
-func (r *filePages) SeekToRow(rowIndex int64) (err error) {
-	if r.column.offsetIndex == nil {
-		_, err = r.section.Seek(r.dataOffset-r.baseOffset, io.SeekStart)
-		r.skip = rowIndex
-		r.page.index = 0
-	} else {
-		pages := r.column.offsetIndex.PageLocations
+		pages := f.chunk.offsetIndex.PageLocations
 		index := sort.Search(len(pages), func(i int) bool {
 			return pages[i].FirstRowIndex > rowIndex
 		}) - 1
 		if index < 0 {
 			return ErrSeekOutOfRange
 		}
-		_, err = r.section.Seek(pages[index].Offset-r.baseOffset, io.SeekStart)
-		r.skip = rowIndex - pages[index].FirstRowIndex
-		r.page.index = index
+		_, err = f.section.Seek(pages[index].Offset-f.baseOffset, io.SeekStart)
+		f.skip = rowIndex - pages[index].FirstRowIndex
+		f.index = index
 	}
-	r.rbuf.Reset(r.section)
+	f.rbuf.Reset(&f.section)
 	return err
 }
 
-type filePage struct {
-	column     *Column
-	columnType Type
-	dictionary Dictionary
-
-	codec  format.CompressionCodec
-	header format.PageHeader
-	data   bytes.Reader
-
-	index    int
-	minValue Value
-	maxValue Value
-
-	// This field caches the state used when reading values from the page.
-	// We allocate it separately to avoid creating it if the Values method
-	// is never called (e.g. when the page data is never decompressed).
-	// The state is released when the parent page reader reaches EOF.
-	values *filePageValueReaderState
+func (f *filePages) Close() error {
+	putBufioReader(f.rbuf, f.rbufpool)
+	f.chunk = nil
+	f.section = io.SectionReader{}
+	f.rbuf = nil
+	f.rbufpool = nil
+	f.baseOffset = 0
+	f.dataOffset = 0
+	f.dictOffset = 0
+	f.index = 0
+	f.skip = 0
+	f.dictionary = nil
+	return nil
 }
+
+func (f *filePages) columnPath() columnPath {
+	return columnPath(f.chunk.column.Path())
+}
+
+type putBufioReaderFunc func()
 
 var (
-	errPageIndexExceedsColumnIndexNullPages  = errors.New("page index exceeds column index null pages")
-	errPageIndexExceedsColumnIndexMinValues  = errors.New("page index exceeds column index min values")
-	errPageIndexExceedsColumnIndexMaxValues  = errors.New("page index exceeds column index max values")
-	errPageIndexExceedsColumnIndexNullCounts = errors.New("page index exceeds column index null counts")
-	errPageHasNoColumnIndexNorStatistics     = errors.New("column has no index and page has no statistics")
+	bufioReaderPoolLock sync.Mutex
+	bufioReaderPool     = map[int]*sync.Pool{}
 )
 
-func (p *filePage) statistics() *format.Statistics {
-	switch p.header.Type {
-	case format.DataPageV2:
-		return &p.header.DataPageHeaderV2.Statistics
-	case format.DataPage:
-		return &p.header.DataPageHeader.Statistics
-	default:
-		return nil
-	}
-}
-
-func (p *filePage) parseColumnIndex(columnIndex *format.ColumnIndex) (err error) {
-	if p.index >= len(columnIndex.NullPages) {
-		return p.errColumnIndex(errPageIndexExceedsColumnIndexNullPages)
-	}
-	if p.index >= len(columnIndex.MinValues) {
-		return p.errColumnIndex(errPageIndexExceedsColumnIndexMinValues)
-	}
-	if p.index >= len(columnIndex.MaxValues) {
-		return p.errColumnIndex(errPageIndexExceedsColumnIndexMaxValues)
-	}
-	if p.index >= len(columnIndex.NullCounts) {
-		return p.errColumnIndex(errPageIndexExceedsColumnIndexNullCounts)
-	}
-
-	minValue := columnIndex.MinValues[p.index]
-	maxValue := columnIndex.MaxValues[p.index]
-
-	if stats := p.statistics(); stats != nil {
-		if stats.MinValue == nil {
-			stats.MinValue = minValue
-		}
-		if stats.MaxValue == nil {
-			stats.MaxValue = maxValue
-		}
-		if stats.NullCount == 0 {
-			stats.NullCount = columnIndex.NullCounts[p.index]
-		}
-	}
-
-	if columnIndex.NullPages[p.index] {
-		p.minValue = Value{}
-		p.maxValue = Value{}
+func getBufioReader(r io.Reader, bufferSize int) (*bufio.Reader, *sync.Pool) {
+	pool := getBufioReaderPool(bufferSize)
+	rbuf, _ := pool.Get().(*bufio.Reader)
+	if rbuf == nil {
+		rbuf = bufio.NewReaderSize(r, bufferSize)
 	} else {
-		kind := p.columnType.Kind()
-		p.minValue, err = parseValue(kind, minValue)
-		if err != nil {
-			return p.errColumnIndex(err)
-		}
-		p.maxValue, err = parseValue(kind, maxValue)
-		if err != nil {
-			return p.errColumnIndex(err)
-		}
+		rbuf.Reset(r)
 	}
-
-	return nil
+	return rbuf, pool
 }
 
-func (p *filePage) parseStatistics() (err error) {
-	kind := p.columnType.Kind()
-	stats := p.statistics()
-
-	if stats == nil {
-		return p.errStatistics(errPageHasNoColumnIndexNorStatistics)
-	}
-
-	if stats.MinValue == nil {
-		p.minValue = Value{}
-	} else {
-		p.minValue, err = parseValue(kind, stats.MinValue)
-		if err != nil {
-			return p.errStatistics(err)
-		}
-	}
-
-	if stats.MaxValue == nil {
-		p.maxValue = Value{}
-	} else {
-		p.maxValue, err = parseValue(kind, stats.MaxValue)
-		if err != nil {
-			return p.errStatistics(err)
-		}
-	}
-
-	return nil
-}
-
-func (p *filePage) errColumnIndex(err error) error {
-	return fmt.Errorf("reading bounds of page %d from index of column %q: %w", p.index, p.columnPath(), err)
-}
-
-func (p *filePage) errStatistics(err error) error {
-	return fmt.Errorf("reading bounds of page %d from statistics in column %q: %w", p.index, p.columnPath(), err)
-}
-
-func (p *filePage) columnPath() columnPath {
-	return columnPath(p.column.Path())
-}
-
-func (p *filePage) Column() int {
-	return int(p.column.Index())
-}
-
-func (p *filePage) Dictionary() Dictionary {
-	return p.dictionary
-}
-
-func (p *filePage) NumRows() int64 {
-	switch p.header.Type {
-	case format.DataPageV2:
-		return int64(p.header.DataPageHeaderV2.NumRows)
-	default:
-		return 0
+func putBufioReader(rbuf *bufio.Reader, pool *sync.Pool) {
+	if rbuf != nil && pool != nil {
+		rbuf.Reset(nil)
+		pool.Put(rbuf)
 	}
 }
 
-func (p *filePage) NumValues() int64 {
-	switch p.header.Type {
-	case format.DataPageV2:
-		return int64(p.header.DataPageHeaderV2.NumValues)
-	case format.DataPage:
-		return int64(p.header.DataPageHeader.NumValues)
-	case format.DictionaryPage:
-		return int64(p.header.DictionaryPageHeader.NumValues)
-	default:
-		return 0
+func getBufioReaderPool(size int) *sync.Pool {
+	bufioReaderPoolLock.Lock()
+	defer bufioReaderPoolLock.Unlock()
+
+	if pool := bufioReaderPool[size]; pool != nil {
+		return pool
 	}
+
+	pool := &sync.Pool{}
+	bufioReaderPool[size] = pool
+	return pool
 }
 
-func (p *filePage) NumNulls() int64 {
-	switch p.header.Type {
-	case format.DataPageV2:
-		return int64(p.header.DataPageHeaderV2.NumNulls)
-	case format.DataPage:
-		return p.header.DataPageHeader.Statistics.NullCount
-	default:
-		return 0
+var pageHeaderPool = &sync.Pool{}
+
+func getPageHeader() *format.PageHeader {
+	h, _ := pageHeaderPool.Get().(*format.PageHeader)
+	if h != nil {
+		return h
 	}
+	return new(format.PageHeader)
 }
 
-func (p *filePage) Bounds() (min, max Value) {
-	return p.minValue, p.maxValue
-}
-
-func (p *filePage) Size() int64 {
-	return int64(p.header.UncompressedPageSize)
-}
-
-func (p *filePage) Values() ValueReader {
-	if p.values == nil {
-		p.values = new(filePageValueReaderState)
-	}
-	if err := p.values.init(p.columnType, p.column, p.codec, p.PageHeader(), &p.data); err != nil {
-		return &errorValueReader{err: err}
-	}
-	return p.values.reader
-}
-
-func (p *filePage) Buffer() BufferedPage {
-	bufferedPage := p.column.Type().NewColumnBuffer(p.Column(), int(p.Size()))
-	_, err := CopyValues(bufferedPage, p.Values())
-	if err != nil {
-		return &errorPage{err: err, columnIndex: p.Column()}
-	}
-	return bufferedPage.Page()
-}
-
-func (p *filePage) PageHeader() PageHeader {
-	switch p.header.Type {
-	case format.DataPageV2:
-		return DataPageHeaderV2{p.header.DataPageHeaderV2}
-	case format.DataPage:
-		return DataPageHeaderV1{p.header.DataPageHeader}
-	case format.DictionaryPage:
-		return DictionaryPageHeader{p.header.DictionaryPageHeader}
-	default:
-		return unknownPageHeader{&p.header}
+func putPageHeader(h *format.PageHeader) {
+	if h != nil {
+		h.CRC = 0
+		pageHeaderPool.Put(h)
 	}
 }
-
-func (p *filePage) PageData() io.Reader { return &p.data }
-
-func (p *filePage) PageSize() int64 { return int64(p.header.CompressedPageSize) }
-
-func (p *filePage) CRC() uint32 { return uint32(p.header.CRC) }
-
-type filePageValueReaderState struct {
-	reader ColumnReader
-
-	v1 struct {
-		repetitions dataPageLevelV1
-		definitions dataPageLevelV1
-	}
-
-	v2 struct {
-		repetitions dataPageLevelV2
-		definitions dataPageLevelV2
-	}
-
-	repetitions struct {
-		encoding format.Encoding
-		decoder  encoding.Decoder
-	}
-
-	definitions struct {
-		encoding format.Encoding
-		decoder  encoding.Decoder
-	}
-
-	page struct {
-		encoding   format.Encoding
-		decoder    encoding.Decoder
-		compressed *compressedPageReader
-	}
-}
-
-func (s *filePageValueReaderState) release() {
-	if s.page.compressed != nil {
-		releaseCompressedPageReader(s.page.compressed)
-		s.page.compressed = nil
-	}
-}
-
-func (s *filePageValueReaderState) init(columnType Type, column *Column, codec format.CompressionCodec, header PageHeader, data *bytes.Reader) (err error) {
-	var repetitionLevels io.Reader
-	var definitionLevels io.Reader
-	var pageHeader DataPageHeader
-	var pageData io.Reader
-
-	switch h := header.(type) {
-	case DataPageHeaderV2:
-		repetitionLevels, definitionLevels, err = s.initDataPageV2(h, data)
-		if err != nil {
-			return fmt.Errorf("initializing v2 reader for page of column %q: %w", columnPath(column.Path()), err)
-		}
-		if h.IsCompressed(codec) {
-			s.page.compressed = makeCompressedPage(s.page.compressed, codec, data)
-			pageData = s.page.compressed
-		} else {
-			pageData = data
-		}
-		pageHeader = h
-
-	case DataPageHeaderV1:
-		if h.IsCompressed(codec) {
-			s.page.compressed = makeCompressedPage(s.page.compressed, codec, data)
-			pageData = s.page.compressed
-		} else {
-			pageData = data
-		}
-		repetitionLevels, definitionLevels, err = s.initDataPageV1(column, pageData)
-		if err != nil {
-			return fmt.Errorf("initializing v1 reader for page of column %q: %w", columnPath(column.Path()), err)
-		}
-		pageHeader = h
-
-	default:
-		return fmt.Errorf("cannot read values from page of type %s", h.PageType())
-	}
-
-	pageEncoding := pageHeader.Encoding()
-	s.page.decoder = makeDecoder(s.page.decoder, s.page.encoding, pageEncoding, pageData)
-	s.page.encoding = pageEncoding
-
-	maxRepetitionLevel := column.maxRepetitionLevel
-	maxDefinitionLevel := column.maxDefinitionLevel
-	hasLevels := maxRepetitionLevel > 0 || maxDefinitionLevel > 0
-	if hasLevels {
-		repetitionLevelEncoding := pageHeader.RepetitionLevelEncoding()
-		definitionLevelEncoding := pageHeader.DefinitionLevelEncoding()
-		s.repetitions.decoder = makeDecoder(s.repetitions.decoder, s.repetitions.encoding, repetitionLevelEncoding, repetitionLevels)
-		s.definitions.decoder = makeDecoder(s.definitions.decoder, s.definitions.encoding, definitionLevelEncoding, definitionLevels)
-		s.repetitions.encoding = repetitionLevelEncoding
-		s.definitions.encoding = definitionLevelEncoding
-	}
-
-	if s.reader == nil {
-		bufferSize := defaultReadBufferSize
-		if hasLevels {
-			bufferSize /= 2
-		}
-		s.reader = columnType.NewColumnReader(int(column.index), bufferSize)
-		if hasLevels {
-			s.reader = newFileColumnReader(s.reader, maxRepetitionLevel, maxDefinitionLevel, bufferSize)
-		}
-	}
-
-	switch r := s.reader.(type) {
-	case *fileColumnReader:
-		r.reset(int(header.NumValues()), s.repetitions.decoder, s.definitions.decoder, s.page.decoder)
-	default:
-		r.Reset(s.page.decoder)
-	}
-
-	return nil
-}
-
-func (s *filePageValueReaderState) initDataPageV1(column *Column, data io.Reader) (repetitionLevels, definitionLevels io.Reader, err error) {
-	s.v1.repetitions.reset()
-	s.v1.definitions.reset()
-
-	if column.MaxRepetitionLevel() > 0 {
-		if err := s.v1.repetitions.readDataPageV1Level(data, "repetition"); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	if column.MaxDefinitionLevel() > 0 {
-		if err := s.v1.definitions.readDataPageV1Level(data, "definition"); err != nil {
-			return nil, nil, err
-		}
-	}
-
-	repetitionLevels = &s.v1.repetitions.section
-	definitionLevels = &s.v1.definitions.section
-	return repetitionLevels, definitionLevels, nil
-}
-
-func (s *filePageValueReaderState) initDataPageV2(header DataPageHeaderV2, data *bytes.Reader) (repetitionLevels, definitionLevels io.Reader, err error) {
-	repetitionLevelsByteLength := header.RepetitionLevelsByteLength()
-	definitionLevelsByteLength := header.DefinitionLevelsByteLength()
-
-	if repetitionLevelsByteLength > 0 {
-		s.v2.repetitions.setDataPageV2Section(data, 0, repetitionLevelsByteLength)
-	} else {
-		s.v2.repetitions.reset()
-	}
-
-	if definitionLevelsByteLength > 0 {
-		s.v2.definitions.setDataPageV2Section(data, repetitionLevelsByteLength, definitionLevelsByteLength)
-	} else {
-		s.v2.definitions.reset()
-	}
-
-	if _, err := data.Seek(repetitionLevelsByteLength+definitionLevelsByteLength, io.SeekStart); err != nil {
-		return nil, nil, err
-	}
-
-	repetitionLevels = &s.v2.repetitions.section
-	definitionLevels = &s.v2.definitions.section
-	return repetitionLevels, definitionLevels, nil
-}
-
-type dataPageLevelV1 struct {
-	section bytes.Reader
-	buffer  [4]byte
-	data    []byte
-}
-
-func (lvl *dataPageLevelV1) reset() {
-	lvl.section.Reset(nil)
-}
-
-// This method breaks abstraction layers a bit, but it is helpful to avoid
-// decoding repetition and definition levels if there is no need to.
-//
-// In the data header format v1, the repetition and definition levels were
-// part of the compressed page payload. In order to access the data, the
-// levels must be fully read. Because of it, the levels have to be buffered
-// to allow the content to be decoded lazily later on.
-//
-// In the data header format v2, the repetition and definition levels are not
-// part of the compressed page data, they can be accessed by slicing a section
-// of the file according to the level lengths stored in the column metadata
-// header, therefore there is no need to buffer the levels.
-func (lvl *dataPageLevelV1) readDataPageV1Level(r io.Reader, typ string) error {
-	if _, err := io.ReadFull(r, lvl.buffer[:4]); err != nil {
-		return fmt.Errorf("reading RLE encoded length of %s levels: %w", typ, err)
-	}
-
-	n := int(binary.LittleEndian.Uint32(lvl.buffer[:4]))
-	if cap(lvl.data) < n {
-		lvl.data = make([]byte, n)
-	} else {
-		lvl.data = lvl.data[:n]
-	}
-
-	if rn, err := io.ReadFull(r, lvl.data); err != nil {
-		return fmt.Errorf("reading %d/%d bytes of %s levels: %w", rn, n, typ, err)
-	}
-
-	lvl.section.Reset(lvl.data)
-	return nil
-}
-
-type dataPageLevelV2 struct {
-	section io.SectionReader
-}
-
-func (lvl *dataPageLevelV2) reset() {
-	lvl.section = *io.NewSectionReader(nil, 0, 0)
-}
-
-func (lvl *dataPageLevelV2) setDataPageV2Section(file io.ReaderAt, dataPageOffset, dataPageLength int64) {
-	lvl.section = *io.NewSectionReader(file, dataPageOffset, dataPageLength)
-}
-
-func makeCompressedPage(page *compressedPageReader, codec format.CompressionCodec, compressed io.Reader) *compressedPageReader {
-	if page == nil {
-		page = acquireCompressedPageReader(codec, compressed)
-	} else {
-		if page.codec != codec {
-			releaseCompressedPageReader(page)
-			page = acquireCompressedPageReader(codec, compressed)
-		} else {
-			page.Reset(compressed)
-		}
-	}
-	return page
-}
-
-func makeDecoder(decoder encoding.Decoder, oldEncoding, newEncoding format.Encoding, input io.Reader) encoding.Decoder {
-	if decoder == nil || oldEncoding != newEncoding {
-		decoder = LookupEncoding(newEncoding).NewDecoder(input)
-	} else {
-		decoder.Reset(input)
-	}
-	return decoder
-}
-
-var (
-	_ CompressedPage = (*filePage)(nil)
-
-	_ io.ByteReader = (*bufferedSectionReader)(nil)
-	_ io.Reader     = (*bufferedSectionReader)(nil)
-	_ io.WriterTo   = (*bufferedSectionReader)(nil)
-)

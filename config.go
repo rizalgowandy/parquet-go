@@ -2,19 +2,82 @@ package parquet
 
 import (
 	"fmt"
+	"math"
+	"runtime/debug"
 	"strings"
+	"sync"
+
+	"github.com/segmentio/parquet-go/compress"
+)
+
+// ReadMode is an enum that is used to configure the way that a File reads pages.
+type ReadMode int
+
+const (
+	ReadModeSync  ReadMode = iota // ReadModeSync reads pages synchronously on demand (Default).
+	ReadModeAsync                 // ReadModeAsync reads pages asynchronously in the background.
 )
 
 const (
-	DefaultCreatedBy            = "github.com/segmentio/parquet-go"
 	DefaultColumnIndexSizeLimit = 16
-	DefaultColumnBufferSize     = 1 * 1024 * 1024
-	DefaultPageBufferSize       = 1 * 1024 * 1024
+	DefaultColumnBufferCapacity = 16 * 1024
+	DefaultPageBufferSize       = 256 * 1024
+	DefaultWriteBufferSize      = 32 * 1024
 	DefaultDataPageVersion      = 2
 	DefaultDataPageStatistics   = false
 	DefaultSkipPageIndex        = false
 	DefaultSkipBloomFilters     = false
+	DefaultMaxRowsPerRowGroup   = math.MaxInt64
+	DefaultReadMode             = ReadModeSync
 )
+
+const (
+	parquetGoModulePath = "github.com/segmentio/parquet-go"
+)
+
+var (
+	defaultCreatedByInfo string
+	defaultCreatedByOnce sync.Once
+)
+
+func defaultCreatedBy() string {
+	defaultCreatedByOnce.Do(func() {
+		createdBy := parquetGoModulePath
+		build, ok := debug.ReadBuildInfo()
+		if ok {
+			for _, mod := range build.Deps {
+				if mod.Replace == nil && mod.Path == parquetGoModulePath {
+					semver, _, buildsha := parseModuleVersion(mod.Version)
+					createdBy = formatCreatedBy(createdBy, semver, buildsha)
+					break
+				}
+			}
+		}
+		defaultCreatedByInfo = createdBy
+	})
+	return defaultCreatedByInfo
+}
+
+func parseModuleVersion(version string) (semver, datetime, buildsha string) {
+	semver, version = splitModuleVersion(version)
+	datetime, version = splitModuleVersion(version)
+	buildsha, _ = splitModuleVersion(version)
+	semver = strings.TrimPrefix(semver, "v")
+	return
+}
+
+func splitModuleVersion(s string) (head, tail string) {
+	if i := strings.IndexByte(s, '-'); i < 0 {
+		head = s
+	} else {
+		head, tail = s[:i], s[i+1:]
+	}
+	return
+}
+
+func formatCreatedBy(application, version, build string) string {
+	return application + " version " + version + "(build " + build + ")"
+}
 
 // The FileConfig type carries configuration options for parquet files.
 //
@@ -24,11 +87,14 @@ const (
 //	f, err := parquet.OpenFile(reader, size, &parquet.FileConfig{
 //		SkipPageIndex:    true,
 //		SkipBloomFilters: true,
+//		ReadMode:         ReadModeAsync,
 //	})
-//
 type FileConfig struct {
 	SkipPageIndex    bool
 	SkipBloomFilters bool
+	ReadBufferSize   int
+	ReadMode         ReadMode
+	Schema           *Schema
 }
 
 // DefaultFileConfig returns a new FileConfig value initialized with the
@@ -37,6 +103,9 @@ func DefaultFileConfig() *FileConfig {
 	return &FileConfig{
 		SkipPageIndex:    DefaultSkipPageIndex,
 		SkipBloomFilters: DefaultSkipBloomFilters,
+		ReadBufferSize:   defaultReadBufferSize,
+		ReadMode:         DefaultReadMode,
+		Schema:           nil,
 	}
 }
 
@@ -61,8 +130,11 @@ func (c *FileConfig) Apply(options ...FileOption) {
 // ConfigureFile applies configuration options from c to config.
 func (c *FileConfig) ConfigureFile(config *FileConfig) {
 	*config = FileConfig{
-		SkipPageIndex:    config.SkipPageIndex,
-		SkipBloomFilters: config.SkipBloomFilters,
+		SkipPageIndex:    c.SkipPageIndex,
+		SkipBloomFilters: c.SkipBloomFilters,
+		ReadBufferSize:   coalesceInt(c.ReadBufferSize, config.ReadBufferSize),
+		ReadMode:         ReadMode(coalesceInt(int(c.ReadMode), int(config.ReadMode))),
+		Schema:           coalesceSchema(c.Schema, config.Schema),
 	}
 }
 
@@ -79,7 +151,6 @@ func (c *FileConfig) Validate() error {
 //	reader := parquet.NewReader(output, schema, &parquet.ReaderConfig{
 //		// ...
 //	})
-//
 type ReaderConfig struct {
 	Schema *Schema
 }
@@ -128,30 +199,37 @@ func (c *ReaderConfig) Validate() error {
 //	writer := parquet.NewWriter(output, schema, &parquet.WriterConfig{
 //		CreatedBy: "my test program",
 //	})
-//
 type WriterConfig struct {
 	CreatedBy            string
-	ColumnPageBuffers    PageBufferPool
+	ColumnPageBuffers    BufferPool
 	ColumnIndexSizeLimit int
-	PageBufferPool       PageBufferPool
 	PageBufferSize       int
+	WriteBufferSize      int
 	DataPageVersion      int
 	DataPageStatistics   bool
+	MaxRowsPerRowGroup   int64
 	KeyValueMetadata     map[string]string
 	Schema               *Schema
 	BloomFilters         []BloomFilterColumn
+	Compression          compress.Codec
+	Sorting              SortingConfig
 }
 
 // DefaultWriterConfig returns a new WriterConfig value initialized with the
 // default writer configuration.
 func DefaultWriterConfig() *WriterConfig {
 	return &WriterConfig{
-		CreatedBy:            DefaultCreatedBy,
-		ColumnPageBuffers:    &defaultPageBufferPool,
+		CreatedBy:            defaultCreatedBy(),
+		ColumnPageBuffers:    &defaultColumnBufferPool,
 		ColumnIndexSizeLimit: DefaultColumnIndexSizeLimit,
 		PageBufferSize:       DefaultPageBufferSize,
+		WriteBufferSize:      DefaultWriteBufferSize,
 		DataPageVersion:      DefaultDataPageVersion,
 		DataPageStatistics:   DefaultDataPageStatistics,
+		MaxRowsPerRowGroup:   DefaultMaxRowsPerRowGroup,
+		Sorting: SortingConfig{
+			SortingBuffers: &defaultSortingBufferPool,
+		},
 	}
 }
 
@@ -184,16 +262,21 @@ func (c *WriterConfig) ConfigureWriter(config *WriterConfig) {
 			keyValueMetadata[k] = v
 		}
 	}
+
 	*config = WriterConfig{
 		CreatedBy:            coalesceString(c.CreatedBy, config.CreatedBy),
-		ColumnPageBuffers:    coalescePageBufferPool(c.ColumnPageBuffers, config.ColumnPageBuffers),
+		ColumnPageBuffers:    coalesceBufferPool(c.ColumnPageBuffers, config.ColumnPageBuffers),
 		ColumnIndexSizeLimit: coalesceInt(c.ColumnIndexSizeLimit, config.ColumnIndexSizeLimit),
 		PageBufferSize:       coalesceInt(c.PageBufferSize, config.PageBufferSize),
+		WriteBufferSize:      coalesceInt(c.WriteBufferSize, config.WriteBufferSize),
 		DataPageVersion:      coalesceInt(c.DataPageVersion, config.DataPageVersion),
 		DataPageStatistics:   config.DataPageStatistics,
+		MaxRowsPerRowGroup:   config.MaxRowsPerRowGroup,
 		KeyValueMetadata:     keyValueMetadata,
 		Schema:               coalesceSchema(c.Schema, config.Schema),
 		BloomFilters:         coalesceBloomFilters(c.BloomFilters, config.BloomFilters),
+		Compression:          coalesceCompression(c.Compression, config.Compression),
+		Sorting:              coalesceSortingConfig(c.Sorting, config.Sorting),
 	}
 }
 
@@ -205,6 +288,7 @@ func (c *WriterConfig) Validate() error {
 		validatePositiveInt(baseName+"ColumnIndexSizeLimit", c.ColumnIndexSizeLimit),
 		validatePositiveInt(baseName+"PageBufferSize", c.PageBufferSize),
 		validateOneOfInt(baseName+"DataPageVersion", c.DataPageVersion, 1, 2),
+		c.Sorting.Validate(),
 	)
 }
 
@@ -214,20 +298,22 @@ func (c *WriterConfig) Validate() error {
 // directly as argument to the NewBuffer function when needed, for example:
 //
 //	buffer := parquet.NewBuffer(&parquet.RowGroupConfig{
-//		ColumnBufferSize: 8 * 1024 * 1024,
+//		ColumnBufferCapacity: 10_000,
 //	})
-//
 type RowGroupConfig struct {
-	ColumnBufferSize int
-	SortingColumns   []SortingColumn
-	Schema           *Schema
+	ColumnBufferCapacity int
+	Schema               *Schema
+	Sorting              SortingConfig
 }
 
 // DefaultRowGroupConfig returns a new RowGroupConfig value initialized with the
 // default row group configuration.
 func DefaultRowGroupConfig() *RowGroupConfig {
 	return &RowGroupConfig{
-		ColumnBufferSize: DefaultColumnBufferSize,
+		ColumnBufferCapacity: DefaultColumnBufferCapacity,
+		Sorting: SortingConfig{
+			SortingBuffers: &defaultSortingBufferPool,
+		},
 	}
 }
 
@@ -246,7 +332,8 @@ func NewRowGroupConfig(options ...RowGroupOption) (*RowGroupConfig, error) {
 func (c *RowGroupConfig) Validate() error {
 	const baseName = "parquet.(*RowGroupConfig)."
 	return errorInvalidConfiguration(
-		validatePositiveInt(baseName+"ColumnBufferSize", c.ColumnBufferSize),
+		validatePositiveInt(baseName+"ColumnBufferCapacity", c.ColumnBufferCapacity),
+		c.Sorting.Validate(),
 	)
 }
 
@@ -258,10 +345,63 @@ func (c *RowGroupConfig) Apply(options ...RowGroupOption) {
 
 func (c *RowGroupConfig) ConfigureRowGroup(config *RowGroupConfig) {
 	*config = RowGroupConfig{
-		ColumnBufferSize: coalesceInt(c.ColumnBufferSize, config.ColumnBufferSize),
-		SortingColumns:   coalesceSortingColumns(c.SortingColumns, config.SortingColumns),
-		Schema:           coalesceSchema(c.Schema, config.Schema),
+		ColumnBufferCapacity: coalesceInt(c.ColumnBufferCapacity, config.ColumnBufferCapacity),
+		Schema:               coalesceSchema(c.Schema, config.Schema),
+		Sorting:              coalesceSortingConfig(c.Sorting, config.Sorting),
 	}
+}
+
+// The SortingConfig type carries configuration options for parquet row groups.
+//
+// SortingConfig implements the SortingOption interface so it can be used
+// directly as argument to the NewSortingWriter function when needed,
+// for example:
+//
+//	buffer := parquet.NewSortingWriter[Row](
+//		parquet.SortingWriterConfig(
+//			parquet.DropDuplicatedRows(true),
+//		),
+//	})
+type SortingConfig struct {
+	SortingBuffers     BufferPool
+	SortingColumns     []SortingColumn
+	DropDuplicatedRows bool
+}
+
+// DefaultSortingConfig returns a new SortingConfig value initialized with the
+// default row group configuration.
+func DefaultSortingConfig() *SortingConfig {
+	return &SortingConfig{
+		SortingBuffers: &defaultSortingBufferPool,
+	}
+}
+
+// NewSortingConfig constructs a new sorting configuration applying the
+// options passed as arguments.
+//
+// The function returns an non-nil error if some of the options carried invalid
+// configuration values.
+func NewSortingConfig(options ...SortingOption) (*SortingConfig, error) {
+	config := DefaultSortingConfig()
+	config.Apply(options...)
+	return config, config.Validate()
+}
+
+func (c *SortingConfig) Validate() error {
+	const baseName = "parquet.(*SortingConfig)."
+	return errorInvalidConfiguration(
+		validateNotNil(baseName+"SortingBuffers", c.SortingBuffers),
+	)
+}
+
+func (c *SortingConfig) Apply(options ...SortingOption) {
+	for _, opt := range options {
+		opt.ConfigureSorting(c)
+	}
+}
+
+func (c *SortingConfig) ConfigureSorting(config *SortingConfig) {
+	*config = coalesceSortingConfig(*c, *config)
 }
 
 // FileOption is an interface implemented by types that carry configuration
@@ -288,14 +428,61 @@ type RowGroupOption interface {
 	ConfigureRowGroup(*RowGroupConfig)
 }
 
-// SkipPageIndex is a file configuration option which when set to true, prevents
-// automatically reading the page index when opening a parquet file. This is
+// SortingOption is an interface implemented by types that carry configuration
+// options for parquet sorting writers.
+type SortingOption interface {
+	ConfigureSorting(*SortingConfig)
+}
+
+// SkipPageIndex is a file configuration option which prevents automatically
+// reading the page index when opening a parquet file, when set to true. This is
 // useful as an optimization when programs know that they will not need to
 // consume the page index.
 //
 // Defaults to false.
 func SkipPageIndex(skip bool) FileOption {
 	return fileOption(func(config *FileConfig) { config.SkipPageIndex = skip })
+}
+
+// SkipBloomFilters is a file configuration option which prevents automatically
+// reading the bloom filters when opening a parquet file, when set to true.
+// This is useful as an optimization when programs know that they will not need
+// to consume the bloom filters.
+//
+// Defaults to false.
+func SkipBloomFilters(skip bool) FileOption {
+	return fileOption(func(config *FileConfig) { config.SkipBloomFilters = skip })
+}
+
+// FileReadMode is a file configuration option which controls the way pages
+// are read. Currently the only two options are ReadModeAsync and ReadModeSync
+// which control whether or not pages are loaded asynchronously. It can be
+// advantageous to use ReadModeAsync if your reader is backed by network
+// storage.
+//
+// Defaults to ReadModeSync.
+func FileReadMode(mode ReadMode) FileOption {
+	return fileOption(func(config *FileConfig) { config.ReadMode = mode })
+}
+
+// ReadBufferSize is a file configuration option which controls the default
+// buffer sizes for reads made to the provided io.Reader. The default of 4096
+// is appropriate for disk based access but if your reader is backed by network
+// storage it can be advantageous to increase this value to something more like
+// 4 MiB.
+//
+// Defaults to 4096.
+func ReadBufferSize(size int) FileOption {
+	return fileOption(func(config *FileConfig) { config.ReadBufferSize = size })
+}
+
+// FileSchema is used to pass a known schema in while opening a Parquet file.
+// This optimization is only useful if your application is currently opening
+// an extremely large number of parquet files with the same, known schema.
+//
+// Defaults to nil.
+func FileSchema(schema *Schema) FileOption {
+	return fileOption(func(config *FileConfig) { config.Schema = schema })
 }
 
 // PageBufferSize configures the size of column page buffers on parquet writers.
@@ -306,16 +493,49 @@ func SkipPageIndex(skip bool) FileOption {
 // read and write pages rather than controlling the space used by the encoded
 // representation on disk.
 //
-// Defaults to 1 MiB.
+// Defaults to 256KiB.
 func PageBufferSize(size int) WriterOption {
 	return writerOption(func(config *WriterConfig) { config.PageBufferSize = size })
+}
+
+// WriteBufferSize configures the size of the write buffer.
+//
+// Setting the writer buffer size to zero deactivates buffering, all writes are
+// immediately sent to the output io.Writer.
+//
+// Defaults to 32KiB.
+func WriteBufferSize(size int) WriterOption {
+	return writerOption(func(config *WriterConfig) { config.WriteBufferSize = size })
+}
+
+// MaxRowsPerRowGroup configures the maximum number of rows that a writer will
+// produce in each row group.
+//
+// This limit is useful to control size of row groups in both number of rows and
+// byte size. While controlling the byte size of a row group is difficult to
+// achieve with parquet due to column encoding and compression, the number of
+// rows remains a useful proxy.
+//
+// Defaults to unlimited.
+func MaxRowsPerRowGroup(numRows int64) WriterOption {
+	if numRows <= 0 {
+		numRows = DefaultMaxRowsPerRowGroup
+	}
+	return writerOption(func(config *WriterConfig) { config.MaxRowsPerRowGroup = numRows })
 }
 
 // CreatedBy creates a configuration option which sets the name of the
 // application that created a parquet file.
 //
-// By default, this information is omitted.
-func CreatedBy(createdBy string) WriterOption {
+// The option formats the "CreatedBy" file metadata according to the convention
+// described by the parquet spec:
+//
+//	"<application> version <version> (build <build>)"
+//
+// By default, the option is set to the parquet-go module name, version, and
+// build hash.
+func CreatedBy(application, version, build string) WriterOption {
+	createdBy := formatCreatedBy(application, version, build)
 	return writerOption(func(config *WriterConfig) { config.CreatedBy = createdBy })
 }
 
@@ -325,7 +545,7 @@ func CreatedBy(createdBy string) WriterOption {
 // on the amount of memory available.
 //
 // Defaults to using in-memory buffers.
-func ColumnPageBuffers(buffers PageBufferPool) WriterOption {
+func ColumnPageBuffers(buffers BufferPool) WriterOption {
 	return writerOption(func(config *WriterConfig) { config.ColumnPageBuffers = buffers })
 }
 
@@ -390,12 +610,32 @@ func BloomFilters(filters ...BloomFilterColumn) WriterOption {
 	return writerOption(func(config *WriterConfig) { config.BloomFilters = filters })
 }
 
-// ColumnBufferSize creates a configuration option which defines the size of
+// Compression creates a configuration option which sets the default compression
+// codec used by a writer for columns where none were defined.
+func Compression(codec compress.Codec) WriterOption {
+	return writerOption(func(config *WriterConfig) { config.Compression = codec })
+}
+
+// SortingWriterConfig is a writer option which applies configuration specific
+// to sorting writers.
+func SortingWriterConfig(options ...SortingOption) WriterOption {
+	options = append([]SortingOption{}, options...)
+	return writerOption(func(config *WriterConfig) { config.Sorting.Apply(options...) })
+}
+
+// ColumnBufferCapacity creates a configuration option which defines the size of
 // row group column buffers.
 //
-// Defaults to 1 MiB.
-func ColumnBufferSize(size int) RowGroupOption {
-	return rowGroupOption(func(config *RowGroupConfig) { config.ColumnBufferSize = size })
+// Defaults to 16384.
+func ColumnBufferCapacity(size int) RowGroupOption {
+	return rowGroupOption(func(config *RowGroupConfig) { config.ColumnBufferCapacity = size })
+}
+
+// SortingRowGroupConfig is a row group option which applies configuration
+// specific sorting row groups.
+func SortingRowGroupConfig(options ...SortingOption) RowGroupOption {
+	options = append([]SortingOption{}, options...)
+	return rowGroupOption(func(config *RowGroupConfig) { config.Sorting.Apply(options...) })
 }
 
 // SortingColumns creates a configuration option which defines the sorting order
@@ -404,13 +644,32 @@ func ColumnBufferSize(size int) RowGroupOption {
 // The order of sorting columns passed as argument defines the ordering
 // hierarchy; when elements are equal in the first column, the second column is
 // used to order rows, etc...
-func SortingColumns(sortingColumns ...SortingColumn) RowGroupOption {
+func SortingColumns(columns ...SortingColumn) SortingOption {
 	// Make a copy so that we do not retain the input slice generated implicitly
 	// for the variable argument list, and also avoid having a nil slice when
 	// the option is passed with no sorting columns, so we can differentiate it
 	// from it not being passed.
-	sortingColumns = append([]SortingColumn{}, sortingColumns...)
-	return rowGroupOption(func(config *RowGroupConfig) { config.SortingColumns = sortingColumns })
+	columns = append([]SortingColumn{}, columns...)
+	return sortingOption(func(config *SortingConfig) { config.SortingColumns = columns })
+}
+
+// SortingBuffers creates a configuration option which sets the pool of buffers
+// used to hold intermediary state when sorting parquet rows.
+//
+// Defaults to using in-memory buffers.
+func SortingBuffers(buffers BufferPool) SortingOption {
+	return sortingOption(func(config *SortingConfig) { config.SortingBuffers = buffers })
+}
+
+// DropDuplicatedRows configures whether a sorting writer will keep or remove
+// duplicated rows.
+//
+// Two rows are considered duplicates if the values of their all their sorting
+// columns are equal.
+//
+// Defaults to false
+func DropDuplicatedRows(drop bool) SortingOption {
+	return sortingOption(func(config *SortingConfig) { config.DropDuplicatedRows = drop })
 }
 
 type fileOption func(*FileConfig)
@@ -428,6 +687,10 @@ func (opt writerOption) ConfigureWriter(config *WriterConfig) { opt(config) }
 type rowGroupOption func(*RowGroupConfig)
 
 func (opt rowGroupOption) ConfigureRowGroup(config *RowGroupConfig) { opt(config) }
+
+type sortingOption func(*SortingConfig)
+
+func (opt sortingOption) ConfigureSorting(config *SortingConfig) { opt(config) }
 
 func coalesceInt(i1, i2 int) int {
 	if i1 != 0 {
@@ -457,7 +720,7 @@ func coalesceBytes(b1, b2 []byte) []byte {
 	return b2
 }
 
-func coalescePageBufferPool(p1, p2 PageBufferPool) PageBufferPool {
+func coalesceBufferPool(p1, p2 BufferPool) BufferPool {
 	if p1 != nil {
 		return p1
 	}
@@ -478,11 +741,26 @@ func coalesceSortingColumns(s1, s2 []SortingColumn) []SortingColumn {
 	return s2
 }
 
+func coalesceSortingConfig(c1, c2 SortingConfig) SortingConfig {
+	return SortingConfig{
+		SortingBuffers:     coalesceBufferPool(c1.SortingBuffers, c2.SortingBuffers),
+		SortingColumns:     coalesceSortingColumns(c1.SortingColumns, c2.SortingColumns),
+		DropDuplicatedRows: c1.DropDuplicatedRows,
+	}
+}
+
 func coalesceBloomFilters(f1, f2 []BloomFilterColumn) []BloomFilterColumn {
 	if f1 != nil {
 		return f1
 	}
 	return f2
+}
+
+func coalesceCompression(c1, c2 compress.Codec) compress.Codec {
+	if c1 != nil {
+		return c1
+	}
+	return c2
 }
 
 func validatePositiveInt(optionName string, optionValue int) error {
@@ -560,4 +838,5 @@ var (
 	_ ReaderOption   = (*ReaderConfig)(nil)
 	_ WriterOption   = (*WriterConfig)(nil)
 	_ RowGroupOption = (*RowGroupConfig)(nil)
+	_ SortingOption  = (*SortingConfig)(nil)
 )
